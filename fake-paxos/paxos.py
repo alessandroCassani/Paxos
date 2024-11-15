@@ -2,207 +2,339 @@
 import sys
 import socket
 import struct
+import time
+from collections import defaultdict
+import threading
 import json
-import math
-from enum import Enum
 
+# Message class with JSON encoding/decoding
+class Message:
 
-class Message(Enum):
-    PREPARE = "PHASE_1A"
-    PROMISE = "PHASE_1B"
-    ACCEPT_REQUEST = "PHASE_2A"
-    DECIDE = "PHASE_3"
-    CLIENT_VALUE = "CLIENT_VALUE"
+    PHASE1A = 'Phase1A'
+    PHASE1B = 'Phase1B'
+    PHASE2A = 'Phase2A'
+    PHASE2B = 'Phase2B'
+    CLIENT = 'Client'
+    DECIDE = 'Decide'
 
+    @staticmethod
+    def phase_client(value, phase):
+        msg = {
+            'value': value,
+            'phase': phase
+        }
+        return json.dumps(msg)
 
-def encode_json_msg(type, **kwargs):
-    """Encode the message into JSON format"""
-    return json.dumps({"type": type.value, **kwargs}).encode()
+    @staticmethod
+    def phase_1a(c_rnd, phase, key):
+        msg = {
+            'c_rnd_1': c_rnd[0],
+            'c_rnd_2': c_rnd[1],
+            'phase': phase,
+            'key_1': key[0],
+            'key_2': key[1]
+        }
+        return json.dumps(msg)
 
+    @staticmethod
+    def phase_1b(rnd, v_rnd, v_val, phase, key):
+        msg = {
+            'rnd_1': rnd[0],
+            'rnd_2': rnd[1],
+            'v_rnd_0': v_rnd[0],
+            'v_rnd_1': v_rnd[1],
+            'v_val': v_val,
+            'phase': phase,
+            'key_1': key[0],
+            'key_2': key[1]
+        }
+        return json.dumps(msg)
 
-def decode_json_msg(msg):
-    """Decode the JSON message and convert relevant fields"""
-    parsed_msg = json.loads(msg.decode())
-    parsed_msg["type"] = Message(parsed_msg["type"])
-    parsed_msg = {key: tuple(val) if isinstance(val, list) else val for key, val in parsed_msg.items()}
-    return parsed_msg
+    @staticmethod
+    def phase_2a(c_rnd, c_val, phase, key):
+        msg = {
+            'c_rnd_1': c_rnd[0],
+            'c_rnd_2': c_rnd[1],
+            'c_val': c_val,
+            'phase': phase,
+            'key_1': key[0],
+            'key_2': key[1]
+        }
+        return json.dumps(msg)
 
+    @staticmethod
+    def phase_2b(v_rnd, v_val, phase, key):
+        msg = {
+            'v_rnd_1': v_rnd[0],
+            'v_rnd_2': v_rnd[1],
+            'v_val': v_val,
+            'phase': phase,
+            'key_1': key[0],
+            'key_2': key[1]
+        }
+        return json.dumps(msg)
 
-def create_mcast_socket(hostport, join_group=False):
-    """Create and configure a multicast socket for receiving or sending messages"""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    @staticmethod
+    def decision(v_val, phase, key):
+        msg = {
+            'v_val': v_val,
+            'phase': phase,
+            'key_1': key[0],
+            'key_2': key[1]
+        }
+        return json.dumps(msg)
+
+    @staticmethod
+    def handle_proposer_received_message(data):
+        """Handles messages received by the proposer."""
+        try:
+            msg = json.loads(data)
+            if 'value' in msg and 'phase' in msg:
+                print("Received client message")
+                return Message.CLIENT, msg
+        except json.JSONDecodeError as e:
+            pass
+
+        try:
+            msg = json.loads(data)
+            if 'rnd_1' in msg and 'rnd_2' in msg and 'v_rnd_0' in msg and 'v_rnd_1' in msg:
+                print("Received Phase1B message")
+                return Message.PHASE1B, msg
+        except json.JSONDecodeError as e:
+            pass
+
+        try:
+            msg = json.loads(data)
+            if 'v_rnd_1' in msg and 'v_rnd_2' in msg and 'v_val' in msg:
+                print("Received Phase2B message")
+                return Message.PHASE2B, msg
+        except json.JSONDecodeError as e:
+            pass
+
+        try:
+            msg = json.loads(data)
+            if 'v_val' in msg and 'phase' in msg:
+                print("Received Decide message")
+                return Message.DECIDE, msg
+        except json.JSONDecodeError as e:
+            pass
+
+        print("Unknown message type received")
+        return "Unknown", None
+
+    @staticmethod
+    def handle_acceptor_received_message(data):
+        """Handles messages received by the acceptor."""
+        print(f"Raw data received: {data}")  # Debugging line to inspect the raw data
+        
+        try:
+            msg = json.loads(data)
+            if 'c_rnd_1' in msg and 'c_rnd_2' in msg:
+                print("Received Phase1A message")
+                return Message.PHASE1A, msg
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse Phase1A: {e}")
     
-    if join_group:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.bind(hostport)
-        mcast_group = struct.pack("4sl", socket.inet_aton(hostport[0]), socket.INADDR_ANY)
-        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mcast_group)
+        try:
+            msg = json.loads(data)
+            if 'c_rnd_1' in msg and 'c_rnd_2' in msg and 'c_val' in msg:
+                print("Received Phase2A message")
+                return Message.PHASE2A, msg
+        except json.JSONDecodeError as e:
+            print(f"Failed to parse Phase2A: {e}")
 
-    return sock
+        print("Unknown message type received from proposer")
+        return "Unknown", None
 
+# ----------------------------------------------------
+
+def mcast_receiver(hostport):
+    """create a multicast socket listening to the address"""
+    recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    recv_sock.bind(hostport)
+
+    mcast_group = struct.pack("4sl", socket.inet_aton(hostport[0]), socket.INADDR_ANY)
+    recv_sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mcast_group)
+    return recv_sock
+
+def mcast_sender():
+    """create a udp socket"""
+    send_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    return send_sock
 
 def parse_cfg(cfgpath):
-    """Parse the configuration file for host-port mappings"""
     cfg = {}
     with open(cfgpath, "r") as cfgfile:
         for line in cfgfile:
-            role, host, port = line.split()
+            (role, host, port) = line.split()
             cfg[role] = (host, int(port))
     return cfg
 
-
-def handle_prepare_message(msg, states, seq, s, config, id):
-    """Handle the 'PREPARE' message type"""
-    if seq not in states:
-        states[seq] = {"rnd": (0, id), "v_rnd": None, "v_val": None}
-    if msg["c_rnd"] > states[seq]["rnd"]:
-        states[seq]["rnd"] = msg["c_rnd"]
-        promise_msg = encode_json_msg(
-            Message.PROMISE,
-            seq=seq,
-            rnd=states[seq]["rnd"],
-            v_rnd=states[seq]["v_rnd"],
-            v_val=states[seq]["v_val"],
-        )
-        print(f"-> acceptor {id} Received: seq {seq} {Message.PREPARE} Rnd: {states[seq]['rnd']}")
-        s.sendto(promise_msg, config["proposers"])
-
-
-def handle_accept_request(msg, states, seq, s, config, id):
-    """Handle the 'ACCEPT_REQUEST' message type"""
-    if msg["c_rnd"] >= states[seq]["rnd"]:
-        states[seq]["v_rnd"] = msg["c_rnd"]
-        states[seq]["v_val"] = msg["c_val"]
-        accepted_msg = encode_json_msg(
-            Message.DECIDE,
-            seq=seq,
-            v_rnd=states[seq]["v_rnd"],
-            v_val=states[seq]["v_val"],
-        )
-        print(f"-> acceptor {id} seq {seq} Received: {Message.ACCEPT_REQUEST} v_rnd: {states[seq]['v_rnd']} v_val: {states[seq]['v_val']}")
-        s.sendto(accepted_msg, config["learners"])
-
+# ----------------------------------------------------
+lock = threading.Lock()
+number_of_acceptors = 0 # store number of active acceptors
 
 def acceptor(config, id):
-    """Acceptor role in the Paxos protocol"""
-    print("-> acceptor", id)
-    states = {}
-    r = create_mcast_socket(config["acceptors"], join_group=True)
-    s = create_mcast_socket(config["proposers"])
-
-    while True:
-        msg = decode_json_msg(r.recv(2**16))
-        seq = msg["seq"]
-        if msg["type"] == Message.PREPARE:
-            handle_prepare_message(msg, states, seq, s, config, id)
-        elif msg["type"] == Message.ACCEPT_REQUEST:
-            handle_accept_request(msg, states, seq, s, config, id)
-
-
-def handle_client_value(msg, seq, c_rnd_cnt, c_rnd, c_val, s, config, id):
-    """Handle the 'CLIENT_VALUE' message type"""
-    seq = (msg["prop_id"], msg["client_id"])
-    c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
-    c_rnd[seq] = c_rnd_cnt
-    c_val[seq] = msg["value"]
-    prepare_msg = encode_json_msg(
-        Message.PREPARE, c_rnd=c_rnd[seq], seq=seq
-    )
-    print(f"-> proposer {id} Received: {Message.CLIENT_VALUE} c_rnd: {c_rnd[seq]} seq, {seq}")
-    s.sendto(prepare_msg, config["acceptors"])
-
-
-def handle_promise_message(msg, promises, seq, c_rnd, c_val, s, config, id):
-    """Handle the 'PROMISE' message type"""
-    if msg["rnd"] == c_rnd[msg["seq"]]:
-        seq = msg["seq"]
-        promises.setdefault(seq, []).append(msg)
-
-        print(f"-> proposer {id} seq {seq} promises count: {len(promises[seq])} for c_rnd {c_rnd[seq]}")
-
-        if len(promises[seq]) > math.ceil(3 / 2):
-            k = max((p["v_rnd"] for p in promises[seq] if p["v_rnd"]), default=None)
-            if k:
-                c_val[seq] = next(p["v_val"] for p in promises[seq] if p["v_rnd"] == k)
-            accept_msg = encode_json_msg(
-                Message.ACCEPT_REQUEST,
-                seq=seq,
-                c_rnd=c_rnd[seq],
-                c_val=c_val[seq],
-            )
-            s.sendto(accept_msg, config["acceptors"])
-
+   global number_of_acceptors
+   print(f"-> acceptor {id} starting")
+   with lock:
+       number_of_acceptors += 1
+       print(f"Acceptor {id}: Total acceptors now {number_of_acceptors}")
+       
+   state = {}
+   r = mcast_receiver(config["acceptors"])
+   s = mcast_sender()
+   
+   while True:
+       msg = r.recv(2**16)
+       print(f"\nAcceptor {id} received message: {msg}")
+       phase, data = Message.handle_acceptor_received_message(msg)
+       
+       if phase == Message.PHASE1A:
+           key = (data['key_1'], data['key_2'])
+           print(f"Acceptor {id}: Processing Phase1A for key {key}")
+           print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
+           
+           if key not in state:
+               state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
+               print(f"Acceptor {id}: Initialized state for key {key}")
+           
+           if data['c_rnd_1'] > state[key]['rnd'][0] or (data['c_rnd_1'] == state[key]['rnd'][0] and data['c_rnd_2'] > state[key]['rnd'][1]):
+               old_rnd = state[key]['rnd']
+               state[key]['rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
+               print(f"Acceptor {id}: Updated round from {old_rnd} to {state[key]['rnd']}")
+               
+               phase1b_message = Message.phase_1b(state[key]['rnd'], state[key]['v_rnd'], state[key]['v_val'], Message.PHASE1B, key)
+               print(f"Acceptor {id}: Sending Phase1B message: {phase1b_message}")
+               s.sendto(phase1b_message.encode(), config["proposers"])
+           else:
+               print(f"Acceptor {id}: Rejected Phase1A, current round {state[key]['rnd']} >= received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
+       
+       elif phase == Message.PHASE2A:
+           key = (data['key_1'], data['key_2'])
+           print(f"Acceptor {id}: Processing Phase2A for key {key}")
+           print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
+           
+           # Check if we have state for this key
+           if key not in state:
+               state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
+               print(f"Acceptor {id}: Initialized state for key {key}")
+                   
+           if (data['c_rnd_1'], data['c_rnd_2']) >= state[key]['rnd']:
+               old_v_rnd = state[key]['v_rnd']
+               old_v_val = state[key]['v_val']
+               state[key]['v_rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
+               state[key]['v_val'] = data['c_val']
+               print(f"Acceptor {id}: Accepted Phase2A - Updated v_rnd from {old_v_rnd} to {state[key]['v_rnd']}")
+               print(f"Acceptor {id}: Updated v_val from {old_v_val} to {state[key]['v_val']}")
+                   
+               phase2b_message = Message.phase_2b(state[key]['v_rnd'], state[key]['v_val'], Message.PHASE2B, key)
+               print(f"Acceptor {id}: Sending Phase2B message: {phase2b_message}")
+               s.sendto(phase2b_message.encode(), config["learners"])
+           else:
+               print(f"Acceptor {id}: Rejected Phase2A, current round {state[key]['rnd']} > received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
 
 def proposer(config, id):
-    """Proposer role in the Paxos protocol"""
-    print("-> proposer", id)
-    r = create_mcast_socket(config["proposers"], join_group=True)
-    s = create_mcast_socket(config["acceptors"])
-
-    seq = (0, 0)
-    c_rnd_cnt = (0, id)
+    print(f"-> proposer {id} starting")
+    r = mcast_receiver(config["proposers"])
+    s = mcast_sender()
+    
+    c_rnd_cnt = (id, 0)
     c_rnd = {}
     c_val = {}
-    promises = {}
-
-    while True:
-        msg = decode_json_msg(r.recv(2**16))
-        if msg["type"] == Message.CLIENT_VALUE:
-            handle_client_value(msg, seq, c_rnd_cnt, c_rnd, c_val, s, config, id)
-        elif msg["type"] == Message.PROMISE:
-            handle_promise_message(msg, promises, seq, c_rnd, c_val, s, config, id)
-
-
-def learner(config, id):
-    """Learner role in the Paxos protocol"""
-    r = create_mcast_socket(config["learners"], join_group=True)
-    AB_val = {}
+    promises = defaultdict(list)
+    phase2b_responses = defaultdict(list)
     
     while True:
-        msg = decode_json_msg(r.recv(2**16))
-        if msg["type"] == Message.DECIDE:
-            AB_val[msg["seq"]] = msg["v_val"]
-            print(f"Learner {id}: Learned about {msg['v_val']} in rnd {msg['v_rnd']} with seq: {msg['seq']}")
+        msg = r.recv(2**16)
+        print(f"\nProposer {id} received message: {msg}")
+        
+        phase, data = Message.handle_proposer_received_message(msg)
+        print(f"Proposer {id}: Message type: {phase}")
+        
+        if phase == Message.CLIENT:
+            timestamp = int(time.time() * 1000)
+            key = (id, timestamp)
+            c_rnd_cnt = (c_rnd_cnt[0], c_rnd_cnt[1] + 1)
+            c_rnd[key] = c_rnd_cnt
+            c_val[key] = data['value']
+            print(f"Proposer {id}: New proposal - Key: {key}, Round: {c_rnd[key]}, Value: {c_val[key]}")
+            
+            phase1a_msg = Message.phase_1a(c_rnd[key], Message.PHASE1A, key)
+            print(f"Proposer {id}: Sending Phase1A message: {phase1a_msg}")
+            s.sendto(phase1a_msg.encode(), config["acceptors"])
+        
+        elif phase == Message.PHASE1B:
+            key = (data['key_1'], data['key_2'])
+            current_rnd = (data['rnd_1'], data['rnd_2'])
+            print(f"Proposer {id}: Processing Phase1B for key {key}")
+            print(f"Proposer {id}: Current promises: {promises[key]}")
+            print(f"Proposer {id}: Known rounds: {c_rnd}")
+            
+            if key in c_rnd and current_rnd == c_rnd[key]:
+                v_rnd = (data['v_rnd_0'], data['v_rnd_1'])
+                promises[key].append((v_rnd, data['v_val']))
+                print(f"Proposer {id}: Added promise. Count: {len(promises[key])}/{number_of_acceptors}")
+                
+                if len(promises[key]) > number_of_acceptors / 2:
+                    print(f"Proposer {id}: Achieved majority for key {key}")
+                    k = None
+                    for p in promises[key]:
+                        if p[0] != (0, 0):
+                            if k is None or p[0] > k:
+                                k = p[0]
+                    
+                    if k:
+                        c_val[key] = next(p[1] for p in promises[key] if p[0] == k)
+                        print(f"Proposer {id}: Selected value {c_val[key]} from round {k}")
+                    
+                    phase2a_msg = Message.phase_2a(c_rnd[key], c_val[key], Message.PHASE2A, key)
+                    print(f"Proposer {id}: Sending Phase2A message: {phase2a_msg}")
+                    s.sendto(phase2a_msg.encode(), config["acceptors"])
+
+def learner(config, id):
+    print(f"-> learner {id} starting")
+    r = mcast_receiver(config["learners"])
+    decisions = defaultdict(list)
+    
+    while True:
+        msg = r.recv(2**16)
+        print(f"\nLearner {id} received message: {msg}")
+        data = json.loads(msg)
+        
+        key = (data['key_1'], data['key_2'])
+        decisions[key].append(data['v_val'])
+        print(f"Learner {id}: Decision for key {key}")
+        print(f"Learner {id}: Value: {data['v_val']}")
+        print(f"Learner {id}: Total decisions for this key: {len(decisions[key])}")
         sys.stdout.flush()
 
-
 def client(config, id):
-    """Client role that sends values to proposers"""
-    print("-> client", id)
-    s = create_mcast_socket(config["proposers"])
-
-    prop_id = 0
+    print(f"-> client {id} starting")
+    s = mcast_sender()
+    
     for value in sys.stdin:
         value = value.strip()
-        prop_id += 1
-        print(f"client {id}: sending {value} to proposers with prop_id {prop_id}")
-        client_msg = encode_json_msg(
-            Message.CLIENT_VALUE, value=value, client_id=id, prop_id=prop_id
-        )
-        s.sendto(client_msg, config["proposers"])
-    print("client done.")
+        client_msg = Message.phase_client(value, Message.CLIENT)
+        print(f"Client {id}: Sending value {value}")
+        s.sendto(client_msg.encode(), config["proposers"])
+    
+    print(f"Client {id} finished")
 
 
-def main():
-    """Main function to run the appropriate Paxos role"""
+if __name__ == "__main__":
     cfgpath = sys.argv[1]
     config = parse_cfg(cfgpath)
     role = sys.argv[2]
     id = int(sys.argv[3])
-
-    role_map = {
-        "acceptor": acceptor,
-        "proposer": proposer,
-        "learner": learner,
-        "client": client
-    }
-
-    if role not in role_map:
-        print(f"Invalid role: {role}")
-        sys.exit(1)
-
-    role_map[role](config, id)
-
-
-if __name__ == "__main__":
-    main()
+    
+    if role == "acceptor":
+        rolefunc = acceptor
+    elif role == "proposer":
+        rolefunc = proposer
+    elif role == "learner":
+        rolefunc = learner
+    elif role == "client":
+        rolefunc = client
+    rolefunc(config, id)
