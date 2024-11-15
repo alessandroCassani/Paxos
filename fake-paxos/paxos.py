@@ -86,64 +86,35 @@ class Message:
 
     @staticmethod
     def handle_proposer_received_message(data):
-        """Handles messages received by the proposer."""
         try:
             msg = json.loads(data)
-            if 'value' in msg and 'phase' in msg:
-                print("Received client message")
-                return Message.CLIENT, msg
-        except json.JSONDecodeError as e:
+            if 'phase' in msg:
+                if msg['phase'] == Message.PHASE2B:
+                    print("Received Phase2B message")
+                    return Message.PHASE2B, msg
+                elif msg['phase'] == Message.CLIENT:
+                    print("Received client message")
+                    return Message.CLIENT, msg
+                elif msg['phase'] == Message.PHASE1B:
+                    print("Received Phase1B message")
+                    return Message.PHASE1B, msg
+        except json.JSONDecodeError:
             pass
-
-        try:
-            msg = json.loads(data)
-            if 'rnd_1' in msg and 'rnd_2' in msg and 'v_rnd_0' in msg and 'v_rnd_1' in msg:
-                print("Received Phase1B message")
-                return Message.PHASE1B, msg
-        except json.JSONDecodeError as e:
-            pass
-
-        try:
-            msg = json.loads(data)
-            if 'v_rnd_1' in msg and 'v_rnd_2' in msg and 'v_val' in msg:
-                print("Received Phase2B message")
-                return Message.PHASE2B, msg
-        except json.JSONDecodeError as e:
-            pass
-
-        try:
-            msg = json.loads(data)
-            if 'v_val' in msg and 'phase' in msg:
-                print("Received Decide message")
-                return Message.DECIDE, msg
-        except json.JSONDecodeError as e:
-            pass
-
-        print("Unknown message type received")
         return "Unknown", None
 
     @staticmethod
     def handle_acceptor_received_message(data):
-        """Handles messages received by the acceptor."""
-        print(f"Raw data received: {data}")  # Debugging line to inspect the raw data
-        
-        try:
-            msg = json.loads(data)
-            if 'c_rnd_1' in msg and 'c_rnd_2' in msg:
-                print("Received Phase1A message")
-                return Message.PHASE1A, msg
-        except json.JSONDecodeError as e:
-            print(f"Failed to parse Phase1A: {e}")
-    
         try:
             msg = json.loads(data)
             if 'c_rnd_1' in msg and 'c_rnd_2' in msg and 'c_val' in msg:
                 print("Received Phase2A message")
                 return Message.PHASE2A, msg
+            elif 'c_rnd_1' in msg and 'c_rnd_2' in msg:
+                print("Received Phase1A message")
+                return Message.PHASE1A, msg
         except json.JSONDecodeError as e:
-            print(f"Failed to parse Phase2A: {e}")
-
-        print("Unknown message type received from proposer")
+            print(f"Failed to parse message: {e}")
+        
         return "Unknown", None
 
 # ----------------------------------------------------
@@ -187,11 +158,11 @@ def acceptor(config, id):
    s = mcast_sender()
    
    while True:
-       msg = r.recv(2**16)
-       print(f"\nAcceptor {id} received message: {msg}")
-       phase, data = Message.handle_acceptor_received_message(msg)
+        msg = r.recv(2**16)
+        print(f"\nAcceptor {id} received message: {msg}")
+        phase, data = Message.handle_acceptor_received_message(msg)
        
-       if phase == Message.PHASE1A:
+        if phase == Message.PHASE1A:
            key = (data['key_1'], data['key_2'])
            print(f"Acceptor {id}: Processing Phase1A for key {key}")
            print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
@@ -211,29 +182,28 @@ def acceptor(config, id):
            else:
                print(f"Acceptor {id}: Rejected Phase1A, current round {state[key]['rnd']} >= received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
        
-       elif phase == Message.PHASE2A:
-           key = (data['key_1'], data['key_2'])
-           print(f"Acceptor {id}: Processing Phase2A for key {key}")
-           print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
-           
-           # Check if we have state for this key
-           if key not in state:
-               state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
-               print(f"Acceptor {id}: Initialized state for key {key}")
-                   
-           if (data['c_rnd_1'], data['c_rnd_2']) >= state[key]['rnd']:
-               old_v_rnd = state[key]['v_rnd']
-               old_v_val = state[key]['v_val']
-               state[key]['v_rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
-               state[key]['v_val'] = data['c_val']
-               print(f"Acceptor {id}: Accepted Phase2A - Updated v_rnd from {old_v_rnd} to {state[key]['v_rnd']}")
-               print(f"Acceptor {id}: Updated v_val from {old_v_val} to {state[key]['v_val']}")
-                   
-               phase2b_message = Message.phase_2b(state[key]['v_rnd'], state[key]['v_val'], Message.PHASE2B, key)
-               print(f"Acceptor {id}: Sending Phase2B message: {phase2b_message}")
-               s.sendto(phase2b_message.encode(), config["learners"])
-           else:
-               print(f"Acceptor {id}: Rejected Phase2A, current round {state[key]['rnd']} > received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
+        elif phase == Message.PHASE2A:
+            key = (data['key_1'], data['key_2'])
+            print(f"Acceptor {id}: Processing Phase2A for key {key}")
+            print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
+            
+            # Check if we have state for this key
+            if key not in state:
+                state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
+                print(f"Acceptor {id}: Initialized state for key {key}")
+                    
+            if (data['c_rnd_1'], data['c_rnd_2']) >= state[key]['rnd']:
+                old_v_rnd = state[key]['v_rnd']
+                old_v_val = state[key]['v_val']
+                state[key]['v_rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
+                state[key]['v_val'] = data['c_val']
+                print(f"Acceptor {id}: Accepted Phase2A - Updated v_rnd from {old_v_rnd} to {state[key]['v_rnd']}")
+                print(f"Acceptor {id}: Updated v_val from {old_v_val} to {state[key]['v_val']}")
+                        
+                phase2b_message = Message.phase_2b(state[key]['v_rnd'], state[key]['v_val'], Message.PHASE2B, key)
+                s.sendto(phase2b_message.encode(), config["proposers"])
+            else:
+                print(f"Acceptor {id}: Rejected Phase2A, current round {state[key]['rnd']} > received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
 
 def proposer(config, id):
     print(f"-> proposer {id} starting")
@@ -245,6 +215,7 @@ def proposer(config, id):
     c_val = {}
     promises = defaultdict(list)
     phase2b_responses = defaultdict(list)
+    accepted_values = defaultdict(set)
     
     while True:
         msg = r.recv(2**16)
@@ -292,6 +263,18 @@ def proposer(config, id):
                     phase2a_msg = Message.phase_2a(c_rnd[key], c_val[key], Message.PHASE2A, key)
                     print(f"Proposer {id}: Sending Phase2A message: {phase2a_msg}")
                     s.sendto(phase2a_msg.encode(), config["acceptors"])
+                    promises[key] = []
+        elif phase == Message.PHASE2B:
+            key = (data['key_1'], data['key_2'])
+            print(f"Proposer {id}: Processing Phase2B for key {key}")
+            if key in c_rnd:
+                accepted_values[key].add(data['v_val'])
+                print(f"Proposer {id}: Phase2B unique values: {len(accepted_values[key])}")
+                if len(phase2b_responses[key]) == (number_of_acceptors // 2) + 1:
+                    print(f"Proposer {id}: Sending decision")
+                    decision_msg = Message.decision(data['v_val'], Message.DECIDE, key)
+                    s.sendto(decision_msg.encode(), config["learners"])
+                    
 
 def learner(config, id):
     print(f"-> learner {id} starting")
