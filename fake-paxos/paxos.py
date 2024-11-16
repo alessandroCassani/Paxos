@@ -65,7 +65,7 @@ class Message:
         msg = {
             "phase": Message.CLIENT,
             "value": value,
-            "client_id": client_id,
+            "id": client_id,
             "timestamp": timestamp
         }
         return json.dumps(msg).encode()
@@ -110,33 +110,26 @@ def acceptor(config, id):
     try:
         while True:
             msg = json.loads(r.recv(2**16).decode())
-            
             key = tuple(msg["key"]) if "key" in msg else None
             c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
 
             if msg["phase"] == Message.PHASE1A:
                 if key not in states:
                     states[key] = {"rnd": (0, id), "v_rnd": None, "v_val": None}
+                    
                 if c_rnd > states[key]["rnd"]:
                     states[key]["rnd"] = c_rnd
-                    promise_msg = Message.promise(
-                        states[key]["rnd"],
-                        states[key]["v_rnd"],
-                        states[key]["v_val"],
-                        key
-                    )
-                    s.sendto(promise_msg, config["proposers"])
+                    promise = Message.promise(states[key]["rnd"], states[key]["v_rnd"], states[key]["v_val"], key)
+                    s.sendto(promise, config["proposers"])
+                    
             elif msg["phase"] == Message.PHASE2A:
                 if c_rnd >= states[key]["rnd"]:
                     states[key]["v_rnd"] = c_rnd
                     states[key]["v_val"] = msg["c_val"]
-                    decide_msg = Message.decide(
-                        states[key]["v_rnd"],
-                        states[key]["v_val"],
-                        key
-                    )
-                    s.sendto(decide_msg, config["learners"])
-                    s.sendto(decide_msg, config["proposers"])
+                    
+                    decide_msg = Message.decide(states[key]["v_rnd"], states[key]["v_val"], key)
+                    s.sendto(decide_msg, config["learners"])    
+                    s.sendto(decide_msg, config["proposers"])   # sends also to proposers leading to update the pending list (pop)
     finally:
         with lock:
             active_acceptors.remove(id)
@@ -145,7 +138,7 @@ def proposer(config, id):
     print("-> proposer", id)
     r = mcast_receiver(config["proposers"])
     s = mcast_sender()
-    c_rnd_cnt = (0, id)
+    c_rnd_cnt = (0, id)  
     c_rnd = {}
     c_val = {}
     promises = {}
@@ -160,23 +153,23 @@ def proposer(config, id):
         rnd = (msg["rnd_1"], msg["rnd_2"]) if "rnd_1" in msg and "rnd_2" in msg else None
         
         if phase == Message.CLIENT:
-            key = (msg["timestamp"], msg["client_id"])
+            key = (msg["timestamp"], msg["id"])
             c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
             c_rnd[key] = c_rnd_cnt
             c_val[key] = msg["value"]
             prepare_msg = Message.prepare(c_rnd[key], key)
-            pending[key] = time.time()
+            pending[key] = time.time()  # a priori insert for the specific key the time since i start to work for it
             s.sendto(prepare_msg, config["acceptors"])
 
         elif phase == Message.PHASE1B:
-            if key not in c_rnd or rnd != c_rnd[key]:
+            if key not in c_rnd or rnd != c_rnd[key]:  #c-rnd = rnd check
                 continue
 
             if key not in promises:
                 promises[key] = []
 
             promises[key].append(msg)
-            if len(promises[key]) > get_quorum() and get_quorum != 0:
+            if len(promises[key]) > get_quorum() and get_quorum != 0:  # quorum check  (from Qa such that c-rnd = rnd now all checks done)
                 # Check if there are any valid v_rnd values
                 if any(p["v_rnd_1"] is not None and p["v_rnd_2"] is not None for p in promises[key]):
                     k = max((p["v_rnd_1"], p["v_rnd_2"]) for p in promises[key] if p["v_rnd_1"] is not None and p["v_rnd_2"] is not None)
@@ -191,19 +184,17 @@ def proposer(config, id):
                 print('acceptors unavailables')
 
         elif phase == Message.PHASE2B:
-            if key not in learned:
-                learned.append(key)
-                if key in pending:
-                    pending.pop(key)
+            if key in pending:
+                pending.pop(key) # quorum received for decision, so can pop from the pending list
 
         # Retry mechanism
         current_time = time.time()
         for key in list(pending.keys()):
-            if key not in learned and current_time - pending[key] > 5:
-                c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
+            if key not in learned and current_time - pending[key] > 10:
+                c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])  # not received a quorum in that time, so try to resend it
                 c_rnd[key] = c_rnd_cnt
                 prepare_msg = Message.prepare(c_rnd[key], key)
-                pending[key] = time.time()
+                pending[key] = time.time()  # recalculate the starting pending time as before
                 s.sendto(prepare_msg, config["acceptors"])
 
 def learner(config, id):
