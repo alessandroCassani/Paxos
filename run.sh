@@ -9,7 +9,7 @@ if [[ x$projdir == "x" || x$n == "x" ]]; then
     exit 1
 fi
 
-pkill -f "$conf" # kill processes that have the config file in its cmdline
+pkill -f "$conf"
 
 cd $projdir
 
