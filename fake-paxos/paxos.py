@@ -6,6 +6,7 @@ import time
 from collections import defaultdict
 import threading
 import json
+import math
 
 # Message class with JSON encoding/decoding
 class Message:
@@ -147,62 +148,54 @@ lock = threading.Lock()
 active_acceptors = set()
 
 def acceptor(config, id):
-    global active_acceptors
     print(f"-> acceptor {id} starting")
     with lock:
         active_acceptors.add(id)
-        print(f"Acceptor {id}: Total acceptors now {active_acceptors}")
-    try:    
-        state = {}
-        r = mcast_receiver(config["acceptors"])
-        s = mcast_sender()
-        
+    state = {}
+    r = mcast_receiver(config["acceptors"])
+    s = mcast_sender()
+    
+    try:
         while True:
             msg = r.recv(2**16)
-            print(f"\nAcceptor {id} received message: {msg}")
             phase, data = Message.handle_acceptor_received_message(msg)
-        
+            
             if phase == Message.PHASE1A:
                 key = (data['key_1'], data['key_2'])
-                print(f"Acceptor {id}: Processing Phase1A for key {key}")
-                print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
-            
                 if key not in state:
-                    state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
-                    print(f"Acceptor {id}: Initialized state for key {key}")
+                    state[key] = {"rnd": (0, 0), "v_rnd": (0,0), "v_val": None}
+                
+                c_rnd = (data['c_rnd_1'], data['c_rnd_2'])
+                if c_rnd > state[key]['rnd']:
+                    state[key]['rnd'] = c_rnd
+                    phase1b_msg = Message.phase_1b(
+                        state[key]['rnd'],
+                        state[key]['v_rnd'],
+                        state[key]['v_val'],
+                        Message.PHASE1B,
+                        key
+                    )
+                    s.sendto(phase1b_msg.encode(), config["proposers"])
             
-                if data['c_rnd_1'] > state[key]['rnd'][0] or (data['c_rnd_1'] == state[key]['rnd'][0] and data['c_rnd_2'] > state[key]['rnd'][1]):
-                    old_rnd = state[key]['rnd']
-                    state[key]['rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
-                    print(f"Acceptor {id}: Updated round from {old_rnd} to {state[key]['rnd']}")
-                    
-                    phase1b_message = Message.phase_1b(state[key]['rnd'], state[key]['v_rnd'], state[key]['v_val'], Message.PHASE1B, key)
-                    print(f"Acceptor {id}: Sending Phase1B message: {phase1b_message}")
-                    s.sendto(phase1b_message.encode(), config["proposers"])
-                else:
-                    print(f"Acceptor {id}: Rejected Phase1A, current round {state[key]['rnd']} >= received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
-        
             elif phase == Message.PHASE2A:
                 key = (data['key_1'], data['key_2'])
-                print(f"Acceptor {id}: Processing Phase2A for key {key}")
-                print(f"Acceptor {id}: Current state for key {key}: {state.get(key, 'Not found')}")
-                
                 if key not in state:
-                    state[key] = {"rnd": (0, id), "v_rnd": (0, 0), "v_val": None}
-                    print(f"Acceptor {id}: Initialized state for key {key}")
-                        
-                if (data['c_rnd_1'], data['c_rnd_2']) >= state[key]['rnd']:
-                    old_v_rnd = state[key]['v_rnd']
-                    old_v_val = state[key]['v_val']
-                    state[key]['v_rnd'] = (data['c_rnd_1'], data['c_rnd_2'])
+                    state[key] = {"rnd": (0, 0), "v_rnd": (0,0), "v_val": None}
+                
+                c_rnd = (data['c_rnd_1'], data['c_rnd_2'])
+                if c_rnd >= state[key]['rnd']:
+                    state[key]['rnd'] = c_rnd
+                    state[key]['v_rnd'] = c_rnd
                     state[key]['v_val'] = data['c_val']
-                    print(f"Acceptor {id}: Accepted Phase2A - Updated v_rnd from {old_v_rnd} to {state[key]['v_rnd']}")
-                    print(f"Acceptor {id}: Updated v_val from {old_v_val} to {state[key]['v_val']}")
-                            
-                    phase2b_message = Message.phase_2b(state[key]['v_rnd'], state[key]['v_val'], Message.PHASE2B, key)
-                    s.sendto(phase2b_message.encode(), config["proposers"])
-                else:
-                    print(f"Acceptor {id}: Rejected Phase2A, current round {state[key]['rnd']} > received round ({data['c_rnd_1']}, {data['c_rnd_2']})")
+                    
+                    # Send Phase2B directly to learners only
+                    phase2b_msg = Message.phase_2b(
+                        state[key]['v_rnd'],
+                        state[key]['v_val'],
+                        Message.PHASE2B,
+                        key
+                    )
+                    s.sendto(phase2b_msg.encode(), config["learners"])
     finally:
         with lock:
             active_acceptors.remove(id)
@@ -212,73 +205,92 @@ def proposer(config, id):
     r = mcast_receiver(config["proposers"])
     s = mcast_sender()
     
-    c_rnd_cnt = (id, 0)
+    c_rnd_cnt = (0, id)
     c_rnd = {}
     c_val = {}
     promises = defaultdict(list)
-    phase2b_responses = defaultdict(list)
-    accepted_values = defaultdict(set)
+    pending = {}
     
     while True:
         msg = r.recv(2**16)
-        print(f"\nProposer {id} received message: {msg}")
-        
         phase, data = Message.handle_proposer_received_message(msg)
-        print(f"Proposer {id}: Message type: {phase}")
         
         if phase == Message.CLIENT:
             timestamp = int(time.time() * 1000)
             key = (id, timestamp)
-            c_rnd_cnt = (c_rnd_cnt[0], c_rnd_cnt[1] + 1)
+            c_rnd_cnt = (c_rnd_cnt[0] + 1, id)
             c_rnd[key] = c_rnd_cnt
             c_val[key] = data['value']
-            print(f"Proposer {id}: New proposal - Key: {key}, Round: {c_rnd[key]}, Value: {c_val[key]}")
+            pending[key] = {
+                'value': data['value'],
+                'timestamp': time.time()
+            }
             
             phase1a_msg = Message.phase_1a(c_rnd[key], Message.PHASE1A, key)
-            print(f"Proposer {id}: Sending Phase1A message: {phase1a_msg}")
             s.sendto(phase1a_msg.encode(), config["acceptors"])
         
         elif phase == Message.PHASE1B:
             key = (data['key_1'], data['key_2'])
-            current_rnd = (data['rnd_1'], data['rnd_2'])
-            if key in c_rnd and current_rnd == c_rnd[key]:
-                v_rnd = (data['v_rnd_0'], data['v_rnd_1'])
-                promises[key].append((v_rnd, data['v_val']))
+            if key not in c_rnd or (data['rnd_1'], data['rnd_2']) != c_rnd[key]:
+                continue
                 
-                if len(promises[key]) > len(active_acceptors) / 2:
-                    # Get highest v_rnd
-                    k = max((p[0] for p in promises[key]), default=(0,0))
-                    # Get all values with v_rnd = k
-                    V = [p[1] for p in promises[key] if p[0] == k]
-                    
-                    if k == (0,0):
-                        # Use original value
-                        pass
-                    else:
-                        # Must use the value from highest round
-                        c_val[key] = V[0]  # Only one value possible
-                    
-                    phase2a_msg = Message.phase_2a(c_rnd[key], c_val[key], Message.PHASE2A, key)
-                    s.sendto(phase2a_msg.encode(), config["acceptors"])
-                elif phase == Message.PHASE2B:
-                    key = (data['key_1'], data['key_2'])
-                    if key in c_rnd:
-                        v_rnd = (data['v_rnd_1'], data['v_rnd_2'])
-                        if v_rnd == c_rnd[key]:  # Check all received v_rnd match c_rnd
-                            phase2b_responses[key].append(v_rnd)
-                            if len(phase2b_responses[key]) > len(active_acceptors) / 2:
-                                decision_msg = Message.decision(c_val[key], Message.DECIDE, key)
-                                s.sendto(decision_msg.encode(), config["learners"])
-                    
-
+            v_rnd = (data['v_rnd_0'], data['v_rnd_1'])
+            promises[key].append((v_rnd, data['v_val']))
+            
+            if len(promises[key]) > len(active_acceptors) / 2:
+                highest_v_rnd = max((p[0] for p in promises[key]), default=(0,0))
+                highest_vals = [p[1] for p in promises[key] if p[0] == highest_v_rnd]
+                
+                if key not in pending:
+                    promises[key] = []
+                    continue
+                
+                if highest_v_rnd == (0,0) or all(v is None for v in highest_vals):
+                    c_val[key] = pending[key]['value']
+                else:
+                    c_val[key] = next(v for v in highest_vals if v is not None)
+                
+                phase2a_msg = Message.phase_2a(c_rnd[key], c_val[key], Message.PHASE2A, key)
+                s.sendto(phase2a_msg.encode(), config["acceptors"])
+                promises[key] = []
+        
+        # Retry mechanism
+        current_time = time.time()
+        for key in list(pending.keys()):
+            if current_time - pending[key]['timestamp'] > 5:
+                c_rnd_cnt = (c_rnd_cnt[0] + 1, id)
+                c_rnd[key] = c_rnd_cnt
+                pending[key]['timestamp'] = current_time
+                phase1a_msg = Message.phase_1a(c_rnd[key], Message.PHASE1A, key)
+                s.sendto(phase1a_msg.encode(), config["acceptors"])
+                
+                
 def learner(config, id):
     print(f"-> learner {id} starting")
     r = mcast_receiver(config["learners"])
+    learned_values = []
+    learned_keys = set()
+    phase2b_responses = defaultdict(lambda: defaultdict(set))  # Track 2B responses
+    
     while True:
         msg = r.recv(2**16)
         data = json.loads(msg)
-        print(data['v_val'])
-        sys.stdout.flush()
+        key = (data['key_1'], data['key_2'])
+        
+        if data['phase'] == Message.PHASE2B:  
+            v_rnd = (data['v_rnd_1'], data['v_rnd_2'])
+            v_val = data['v_val']
+            
+            if key not in learned_keys:
+                phase2b_responses[key][v_rnd].add(v_val)
+                
+                # Check if we have majority for this round and value
+                if len(phase2b_responses[key][v_rnd]) == 1 and len(phase2b_responses[key][v_rnd]) > math.ceil(3/2):
+                    learned_keys.add(key)
+                    learned_values.append(v_val)
+                    print(v_val)
+                    sys.stdout.flush()
+                    phase2b_responses[key].clear()
 
 def client(config, id):
     print(f"-> client {id} starting")
@@ -287,7 +299,6 @@ def client(config, id):
     for value in sys.stdin:
         value = value.strip()
         client_msg = Message.phase_client(value, Message.CLIENT)
-        print(f"Client {id}: Sending value {value}")
         s.sendto(client_msg.encode(), config["proposers"])
     
     print(f"Client {id} finished")
