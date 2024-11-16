@@ -143,7 +143,6 @@ def proposer(config, id):
     c_val = {}
     promises = {}
     pending = {}
-    learned = []
 
     while True:
         msg = json.loads(r.recv(2**16).decode())
@@ -187,10 +186,10 @@ def proposer(config, id):
             if key in pending:
                 pending.pop(key) # quorum received for decision, so can pop from the pending list
 
-        # Retry mechanism
+        # Retry
         current_time = time.time()
         for key in list(pending.keys()):
-            if key not in learned and current_time - pending[key] > 10:
+            if current_time - pending[key] > 5:
                 c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])  # not received a quorum in that time, so try to resend it
                 c_rnd[key] = c_rnd_cnt
                 prepare_msg = Message.prepare(c_rnd[key], key)
