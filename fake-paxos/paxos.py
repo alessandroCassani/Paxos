@@ -224,18 +224,14 @@ def learner(config, id):
 def client(config, id):
     print(f"-> client {id} starting")
     s = mcast_sender()
-    last_timestamp = 0
-
+    
     for value in sys.stdin:
         value = value.strip()
         current_time = time.time()
-        timestamp = max(int(current_time * 1_000_000), last_timestamp + 1)
-        last_timestamp = timestamp
-        
-        print(f"client {id}: sending {value} to proposers with timestamp {timestamp}")
+        timestamp = int(current_time * 1_000_000)
         client_msg = Message.client_value(value, id, timestamp)
         s.sendto(client_msg, config["proposers"])
-        time.sleep(0.0001)
+        time.sleep(0.001)
     
     print(f"Client {id} finished")
 
