@@ -203,7 +203,6 @@ def learner(config, id):
 
     while True:
         msg = json.loads(r.recv(2**16).decode())
-        
         key = tuple(msg["key"]) if "key" in msg else None
 
         if msg["phase"] == Message.PHASE2B:
