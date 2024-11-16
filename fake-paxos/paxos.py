@@ -91,6 +91,12 @@ def parse_cfg(cfgpath):
             cfg[role] = (host, int(port))
     return cfg
 
+def get_quorum():
+    if len(active_acceptors) < 2:
+        return 0
+    else:
+        return math.ceil(len(active_acceptors) / 2)
+
 lock = threading.Lock()
 active_acceptors = set()
 
@@ -170,7 +176,7 @@ def proposer(config, id):
                 promises[key] = []
 
             promises[key].append(msg)
-            if len(promises[key]) >= math.ceil(3 / 2):
+            if len(promises[key]) > get_quorum() and get_quorum != 0:
                 # Check if there are any valid v_rnd values
                 if any(p["v_rnd_1"] is not None and p["v_rnd_2"] is not None for p in promises[key]):
                     k = max((p["v_rnd_1"], p["v_rnd_2"]) for p in promises[key] if p["v_rnd_1"] is not None and p["v_rnd_2"] is not None)
@@ -181,6 +187,8 @@ def proposer(config, id):
                 accept_msg = Message.accept(c_rnd[key], c_val[key], key)
                 s.sendto(accept_msg, config["acceptors"])
                 promises[key] = []
+            else:
+                print('acceptors unavailables')
 
         elif phase == Message.PHASE2B:
             if key not in learned:
