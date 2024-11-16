@@ -12,7 +12,7 @@ class Message:
     PHASE1A = "PHASE_1A"
     PHASE1B = "PHASE_1B"
     PHASE2A = "PHASE_2A"
-    PHASE2B = "PHASE_3"
+    PHASE2B = "PHASE_2B"
     CLIENT = "CLIENT_VALUE"
 
     @staticmethod
