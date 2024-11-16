@@ -241,55 +241,43 @@ def proposer(config, id):
         elif phase == Message.PHASE1B:
             key = (data['key_1'], data['key_2'])
             current_rnd = (data['rnd_1'], data['rnd_2'])
-            print(f"Proposer {id}: Processing Phase1B for key {key}")
-            print(f"Proposer {id}: Current promises: {promises[key]}")
-            print(f"Proposer {id}: Known rounds: {c_rnd}")
-            
             if key in c_rnd and current_rnd == c_rnd[key]:
                 v_rnd = (data['v_rnd_0'], data['v_rnd_1'])
                 promises[key].append((v_rnd, data['v_val']))
-                print(f"Proposer {id}: Added promise. Count: {len(promises[key])}/{active_acceptors}")
                 
                 if len(promises[key]) > len(active_acceptors) / 2:
-                    print(f"Proposer {id}: Achieved majority for key {key}")
-                    k = None
-                    for p in promises[key]:
-                        if p[0] != (0, 0):
-                            if k is None or p[0] > k:
-                                k = p[0]
+                    # Get highest v_rnd
+                    k = max((p[0] for p in promises[key]), default=(0,0))
+                    # Get all values with v_rnd = k
+                    V = [p[1] for p in promises[key] if p[0] == k]
                     
-                    if k:
-                        c_val[key] = next(p[1] for p in promises[key] if p[0] == k)
-                        print(f"Proposer {id}: Selected value {c_val[key]} from round {k}")
+                    if k == (0,0):
+                        # Use original value
+                        pass
+                    else:
+                        # Must use the value from highest round
+                        c_val[key] = V[0]  # Only one value possible
                     
                     phase2a_msg = Message.phase_2a(c_rnd[key], c_val[key], Message.PHASE2A, key)
-                    print(f"Proposer {id}: Sending Phase2A message: {phase2a_msg}")
                     s.sendto(phase2a_msg.encode(), config["acceptors"])
-                    promises[key] = []
-        elif phase == Message.PHASE2B:
-            key = (data['key_1'], data['key_2'])
-            if key in c_rnd:
-                phase2b_responses[key].append(data) 
-                if len(phase2b_responses[key]) == (len(active_acceptors) // 2) + 1:  # Check for majority
-                    decision_msg = Message.decision(c_val[key], Message.DECIDE, key)  
-                    s.sendto(decision_msg.encode(), config["learners"])
+                elif phase == Message.PHASE2B:
+                    key = (data['key_1'], data['key_2'])
+                    if key in c_rnd:
+                        v_rnd = (data['v_rnd_1'], data['v_rnd_2'])
+                        if v_rnd == c_rnd[key]:  # Check all received v_rnd match c_rnd
+                            phase2b_responses[key].append(v_rnd)
+                            if len(phase2b_responses[key]) > len(active_acceptors) / 2:
+                                decision_msg = Message.decision(c_val[key], Message.DECIDE, key)
+                                s.sendto(decision_msg.encode(), config["learners"])
                     
 
 def learner(config, id):
     print(f"-> learner {id} starting")
     r = mcast_receiver(config["learners"])
-    decisions = defaultdict(list)
-    
     while True:
         msg = r.recv(2**16)
-        print(f"\nLearner {id} received message: {msg}")
         data = json.loads(msg)
-        
-        key = (data['key_1'], data['key_2'])
-        decisions[key].append(data['v_val'])
-        print(f"Learner {id}: Decision for key {key}")
-        print(f"Learner {id}: Value: {data['v_val']}")
-        print(f"Learner {id}: Total decisions for this key: {len(decisions[key])}")
+        print(data['v_val'])
         sys.stdout.flush()
 
 def client(config, id):
