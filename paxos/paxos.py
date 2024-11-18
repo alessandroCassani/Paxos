@@ -100,6 +100,10 @@ def get_quorum():
 lock = threading.Lock()
 active_acceptors = set()
 
+def resend_prepare(key, prepare_msg, acceptors, sender):
+    sender.sendto(prepare_msg, acceptors)
+    print(f"Resending prepare message for key {key}")
+
 def acceptor(config, id):   
     print("-> acceptor", id)
     states = {}
@@ -143,6 +147,7 @@ def proposer(config, id):
     c_val = {}
     promises = {}
     pending = {}
+    pending_timers = {}
 
     while True:
         msg = json.loads(r.recv(2**16).decode())
@@ -158,6 +163,8 @@ def proposer(config, id):
             c_val[key] = msg["value"]
             prepare_msg = Message.prepare(c_rnd[key], key)
             pending[key] = time.time()  # a priori insert for the specific key the time since i start to work for it
+            pending_timers[key] = threading.Timer(5.0, resend_prepare, args=(key, prepare_msg, config["acceptors"], s))
+            pending_timers[key].start()
             s.sendto(prepare_msg, config["acceptors"])
 
         elif phase == Message.PHASE1B:
@@ -179,22 +186,20 @@ def proposer(config, id):
                 accept_msg = Message.accept(c_rnd[key], c_val[key], key)
                 s.sendto(accept_msg, config["acceptors"])
                 promises[key] = []
+                if key in pending_timers:
+                    pending_timers[key].cancel()
+                    del pending_timers[key]
+                if key in pending:
+                    del pending[key]
             else:
                 print('acceptors unavailables')
 
         elif phase == Message.PHASE2B:
             if key in pending:
-                pending.pop(key) # quorum received for decision, so can pop from the pending list
-
-        # Retry
-        current_time = time.time()
-        for key in list(pending.keys()):
-            if current_time - pending[key] > 5:
-                c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])  # not received a quorum in that time, so try to resend it
-                c_rnd[key] = c_rnd_cnt
-                prepare_msg = Message.prepare(c_rnd[key], key)
-                pending[key] = time.time()  # recalculate the starting pending time as before
-                s.sendto(prepare_msg, config["acceptors"])
+                del pending[key] # quorum received for decision, so can remove from the pending list
+            if key in pending_timers:
+                pending_timers[key].cancel()
+                del pending_timers[key]
 
 def learner(config, id):
     r = mcast_receiver(config["learners"])
@@ -238,4 +243,4 @@ if __name__ == "__main__":
         rolefunc = learner
     elif role == "client":
         rolefunc = client
-    rolefunc(config, id)
+    rolefunc(config, id)	
