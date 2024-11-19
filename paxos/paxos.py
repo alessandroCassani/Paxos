@@ -16,18 +16,17 @@ class Message:
     CLIENT = "CLIENT_VALUE"
 
     @staticmethod
-    def prepare(c_rnd, key, instance_id):
+    def prepare(c_rnd, key):
         msg = {
             "phase": Message.PHASE1A,
             "c_rnd_1": c_rnd[0],
             "c_rnd_2": c_rnd[1],
-            "key": key,
-            "instance": instance_id
+            "key": key
         }
         return json.dumps(msg).encode()
 
     @staticmethod
-    def promise(rnd, v_rnd, v_val, key, instance_id):
+    def promise(rnd, v_rnd, v_val, key):
         msg = {
             "phase": Message.PHASE1B,
             "rnd_1": rnd[0],
@@ -35,32 +34,29 @@ class Message:
             "v_rnd_1": v_rnd[0] if v_rnd else None,
             "v_rnd_2": v_rnd[1] if v_rnd else None,
             "v_val": v_val,
-            "key": key,
-            "instance": instance_id
+            "key": key
         }
         return json.dumps(msg).encode()
 
     @staticmethod
-    def accept(c_rnd, c_val, key, instance_id):
+    def accept(c_rnd, c_val, key):
         msg = {
             "phase": Message.PHASE2A,
             "c_rnd_1": c_rnd[0],
             "c_rnd_2": c_rnd[1],
             "c_val": c_val,
-            "key": key,
-            "instance": instance_id
+            "key": key
         }
         return json.dumps(msg).encode()
 
     @staticmethod
-    def decide(v_rnd, v_val, key, instance_id):
+    def decide(v_rnd, v_val, key):
         msg = {
             "phase": Message.PHASE2B,
             "v_rnd_1": v_rnd[0],
             "v_rnd_2": v_rnd[1],
             "v_val": v_val,
-            "key": key,
-            "instance": instance_id
+            "key": key
         }
         return json.dumps(msg).encode()
 
@@ -104,12 +100,12 @@ def get_quorum():
 lock = threading.Lock()
 active_acceptors = set()
 
-def resend_prepare(instance_id, prepare_msg, acceptors, sender):
+def resend_prepare(key, prepare_msg, acceptors, sender):
     sender.sendto(prepare_msg, acceptors)
-    print(f"Resending prepare message for instance {instance_id}")
+    print(f"Resending prepare message for key {key}")
 
 def acceptor(config, id):   
-    print(f"-> acceptor {id}")
+    print("-> acceptor", id)
     states = {}
     with lock:
         active_acceptors.add(id)
@@ -118,198 +114,118 @@ def acceptor(config, id):
     try:
         while True:
             msg = json.loads(r.recv(2**16).decode())
-            instance_id = msg.get("instance")
-            key = msg.get("key")
-
-            if instance_id not in states:
-                states[instance_id] = {"rnd": (0, id), "v_rnd": None, "v_val": None}
-                print(f"Created new state for instance {instance_id}")
+            key = tuple(msg["key"]) if "key" in msg else None
+            c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
 
             if msg["phase"] == Message.PHASE1A:
-                c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
-                print(f"Received PHASE1A for instance {instance_id}")
-                if c_rnd > states[instance_id]["rnd"]:
-                    states[instance_id]["rnd"] = c_rnd
-                    promise = Message.promise(
-                        states[instance_id]["rnd"],
-                        states[instance_id]["v_rnd"],
-                        states[instance_id]["v_val"],
-                        key,
-                        instance_id
-                    )
+                if key not in states:
+                    states[key] = {"rnd": (0, id), "v_rnd": None, "v_val": None}
+                    
+                if c_rnd > states[key]["rnd"]:
+                    states[key]["rnd"] = c_rnd
+                    promise = Message.promise(states[key]["rnd"], states[key]["v_rnd"], states[key]["v_val"], key)
                     s.sendto(promise, config["proposers"])
-                    print(f"Sent promise for instance {instance_id}")
-
+                    
             elif msg["phase"] == Message.PHASE2A:
-                c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
-                print(f"Received PHASE2A for instance {instance_id}")
-                if c_rnd >= states[instance_id]["rnd"]:
-                    states[instance_id]["v_rnd"] = c_rnd
-                    states[instance_id]["v_val"] = msg["c_val"]
-                    decide_msg = Message.decide(
-                        states[instance_id]["v_rnd"],
-                        states[instance_id]["v_val"],
-                        key,
-                        instance_id
-                    )
-                    s.sendto(decide_msg, config["proposers"])
-                    s.sendto(decide_msg, config["learners"])  # Send directly to learners
-                    print(f"Sent PHASE2B for instance {instance_id} to proposers and learners")
-    except Exception as e:
-        print(f"Error in acceptor: {e}")
-        raise e
+                if c_rnd >= states[key]["rnd"]:
+                    states[key]["v_rnd"] = c_rnd
+                    states[key]["v_val"] = msg["c_val"]
+                    
+                    decide_msg = Message.decide(states[key]["v_rnd"], states[key]["v_val"], key)
+                    s.sendto(decide_msg, config["learners"])    
+                    s.sendto(decide_msg, config["proposers"])   # sends also to proposers leading to update the pending list (pop)
     finally:
         with lock:
             active_acceptors.remove(id)
 
 def proposer(config, id):
-    print(f"-> proposer {id}")
+    print("-> proposer", id)
     r = mcast_receiver(config["proposers"])
     s = mcast_sender()
-    
-    c_rnd_cnt = (0, id)
-    current_instance = 0
-    decided_values = set()
-    pending_values = []
-    instances = {}
+    c_rnd_cnt = (0, id)  
+    c_rnd = {}
+    c_val = {}
+    promises = {}
+    pending = {}
     pending_timers = {}
 
-    def start_next_instance():
-        nonlocal current_instance, c_rnd_cnt
-        if pending_values and not instances.get(current_instance, {}).get("pending", False):
-            value = pending_values[0]
-            if value not in decided_values:
-                c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
-                
-                if current_instance not in instances:
-                    instances[current_instance] = {
-                        "c_rnd": c_rnd_cnt,
-                        "c_val": value,
-                        "promises": [],
-                        "pending": True
-                    }
-                
-                prepare_msg = Message.prepare(c_rnd_cnt, ("value", id), current_instance)
-                s.sendto(prepare_msg, config["acceptors"])
-                print(f"Started instance {current_instance} with value {value}")
-                
-                if current_instance in pending_timers:
-                    pending_timers[current_instance].cancel()
-                pending_timers[current_instance] = threading.Timer(
-                    5.0, 
-                    resend_prepare, 
-                    args=(current_instance, prepare_msg, config["acceptors"], s)
-                )
-                pending_timers[current_instance].start()
+    while True:
+        msg = json.loads(r.recv(2**16).decode())
+        
+        phase = msg["phase"]
+        key = tuple(msg["key"]) if "key" in msg else None
+        rnd = (msg["rnd_1"], msg["rnd_2"]) if "rnd_1" in msg and "rnd_2" in msg else None
+        
+        if phase == Message.CLIENT:
+            key = (msg["timestamp"], msg["id"])
+            c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
+            c_rnd[key] = c_rnd_cnt
+            c_val[key] = msg["value"]
+            prepare_msg = Message.prepare(c_rnd[key], key)
+            pending[key] = time.time()  # a priori insert for the specific key the time since i start to work for it
+            pending_timers[key] = threading.Timer(5.0, resend_prepare, args=(key, prepare_msg, config["acceptors"], s))
+            pending_timers[key].start()
+            s.sendto(prepare_msg, config["acceptors"])
 
-    try:
-        while True:
-            msg = json.loads(r.recv(2**16).decode())
-            phase = msg["phase"]
+        elif phase == Message.PHASE1B:
+            if key not in c_rnd or rnd != c_rnd[key]:  #c-rnd = rnd check
+                continue
 
-            if phase == Message.CLIENT:
-                pending_values.append(msg["value"])
-                print(f"Received value: {msg['value']}")
-                if current_instance == len(instances):
-                    start_next_instance()
+            if key not in promises:
+                promises[key] = []
 
-            elif phase == Message.PHASE1B:
-                instance_id = msg["instance"]
-                if instance_id != current_instance:
-                    continue
-
-                inst = instances[instance_id]
-                inst["promises"].append(msg)
-                print(f"Received promise for instance {instance_id}, now have {len(inst['promises'])} promises")
-
-                if len(inst["promises"]) > get_quorum() and get_quorum() != 0:
-                    if any(p["v_rnd_1"] is not None and p["v_rnd_2"] is not None for p in inst["promises"]):
-                        k = max(
-                            (p["v_rnd_1"], p["v_rnd_2"]) 
-                            for p in inst["promises"] 
-                            if p["v_rnd_1"] is not None and p["v_rnd_2"] is not None
+            promises[key].append(msg)
+            if len(promises[key]) > get_quorum() and get_quorum != 0:  # quorum check  (from Qa such that c-rnd = rnd now all checks done)
+                # Check if there are any valid v_rnd values
+                if any(p["v_rnd_1"] is not None and p["v_rnd_2"] is not None for p in promises[key]):
+                    k = max((p["v_rnd_1"], p["v_rnd_2"]) for p in promises[key] if p["v_rnd_1"] is not None and p["v_rnd_2"] is not None)
+                    if k:
+                        c_val[key] = next(
+                            p["v_val"] for p in promises[key] if (p["v_rnd_1"], p["v_rnd_2"]) == k
                         )
-                        if k:
-                            inst["c_val"] = next(
-                                p["v_val"] 
-                                for p in inst["promises"] 
-                                if (p["v_rnd_1"], p["v_rnd_2"]) == k
-                            )
+                accept_msg = Message.accept(c_rnd[key], c_val[key], key)
+                s.sendto(accept_msg, config["acceptors"])
+                promises[key] = []
+                if key in pending_timers:
+                    pending_timers[key].cancel()
+                    del pending_timers[key]
+                if key in pending:
+                    del pending[key]
+            else:
+                print('acceptors unavailables')
 
-                    accept_msg = Message.accept(inst["c_rnd"], inst["c_val"], ("value", id), instance_id)
-                    s.sendto(accept_msg, config["acceptors"])
-                    print(f"Sent accept for instance {instance_id}")
-                    inst["promises"] = []
-
-                    if instance_id in pending_timers:
-                        pending_timers[instance_id].cancel()
-                        del pending_timers[instance_id]
-
-            elif phase == Message.PHASE2B:
-                instance_id = msg["instance"]
-                if instance_id != current_instance:
-                    continue
-
-                print(f"Received PHASE2B for instance {instance_id}")
-
-                if instance_id in pending_timers:
-                    pending_timers[instance_id].cancel()
-                    del pending_timers[instance_id]
-
-                decided_values.add(msg["v_val"])
-                pending_values.pop(0)
-                instances[instance_id]["pending"] = False
-                current_instance += 1
-                
-                if pending_values:
-                    start_next_instance()
-
-    except Exception as e:
-        print(f"Error in proposer: {e}")
-        raise e
+        elif phase == Message.PHASE2B:
+            if key in pending:
+                del pending[key] # quorum received for decision, so can remove from the pending list
+            if key in pending_timers:
+                pending_timers[key].cancel()
+                del pending_timers[key]
 
 def learner(config, id):
-    print(f"-> learner {id}")
     r = mcast_receiver(config["learners"])
     learned = {}
-    current_instance = 0
-    
-    try:
-        while True:
-            data = r.recv(2**16)
-            print(f"Learner received data of length: {len(data)}")
-            msg = json.loads(data.decode())
-            print(f"Learner decoded message for instance: {msg.get('instance')}")
-            
-            if msg["phase"] == Message.PHASE2B:
-                instance_id = msg["instance"]
-                if instance_id not in learned:
-                    learned[instance_id] = msg["v_val"]
-                    print(f"=== DECIDED === Value {msg['v_val']} in instance {instance_id}")
-                    sys.stdout.flush()
-    except Exception as e:
-        print(f"Error in learner: {e}")
-        raise e
+
+    while True:
+        msg = json.loads(r.recv(2**16).decode())
+        key = tuple(msg["key"]) if "key" in msg else None
+
+        if msg["phase"] == Message.PHASE2B:
+            if key not in learned:
+                learned[key] = msg["v_val"]
+                print(msg["v_val"])
+                sys.stdout.flush()
 
 def client(config, id):
     print(f"-> client {id} starting")
     s = mcast_sender()
     
-    # Read all values first
-    values = []
     for value in sys.stdin:
-        values.append(value.strip())
-    
-    print(f"Client {id} will propose {len(values)} values")
-    
-    # Send values
-    for value in values:
+        value = value.strip()
         current_time = time.time()
         timestamp = int(current_time * 1_000_000)
         client_msg = Message.client_value(value, id, timestamp)
         s.sendto(client_msg, config["proposers"])
         time.sleep(0.001)
-        print(f"Client {id} sent value: {value}")
     
     print(f"Client {id} finished")
 
@@ -327,4 +243,4 @@ if __name__ == "__main__":
         rolefunc = learner
     elif role == "client":
         rolefunc = client
-    rolefunc(config, id)
+    rolefunc(config, id)	
