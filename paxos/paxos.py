@@ -119,6 +119,8 @@ def acceptor(config, id):
         except Exception as e:
             print(f"Acceptor {id} error: {e}")
 
+import time
+
 def proposer(config, id):
     print(f"-> proposer {id}")
     c_rnd = id
@@ -133,7 +135,7 @@ def proposer(config, id):
     def start_instance(instance_id, proposal_tuple):
         nonlocal c_rnd
         c_rnd += 100
-        
+
         instances[instance_id] = {
             "c_val": {
                 "value": proposal_tuple[0],
@@ -141,9 +143,10 @@ def proposer(config, id):
                 "timestamp": proposal_tuple[2]
             },
             "promises": [],
-            "phase2b_msgs": []
+            "phase2b_msgs": [],
+            "start_time": time.time()
         }
-        
+
         phase1a = create_phase1a_message(c_rnd, instance_id)
         s.sendto(phase1a, config["acceptors"])
         print(f"Proposer {id}: Started instance {instance_id} for value {proposal_tuple[0]}")
@@ -153,60 +156,60 @@ def proposer(config, id):
             data = r.recv(2**16)
             msg = json.loads(data.decode())
             msg_type = msg["type"]
-            
+
             if msg_type == "PROPOSE":
                 proposal = (msg["value"], msg["client_id"], msg["timestamp"])
                 if proposal not in decided_values:
                     pending_values.append(proposal)
                     if len(instances) == current_instance:
                         start_instance(current_instance, pending_values[0])
-                
+
             elif msg_type == "PHASE1B":
                 instance_id = msg["instance"]
                 if instance_id != current_instance:
                     continue
-                
+
                 inst = instances[instance_id]
                 inst["promises"].append(msg)
-                
+
                 if len(inst["promises"]) >= get_quorum(3):
                     promises = inst["promises"]
                     k = max((p["v_rnd"] for p in promises), default=0)
-                    
+
                     if k == 0:
                         c_val = inst["c_val"]
                     else:
                         c_val = next(p["v_val"] for p in promises if p["v_rnd"] == k)
-                    
+
                     phase2a = create_phase2a_message(c_rnd, c_val, instance_id)
                     s.sendto(phase2a, config["acceptors"])
                     inst["promises"] = []
-                
+
             elif msg_type == "PHASE2B":
                 instance_id = msg["instance"]
                 if instance_id != current_instance:
                     continue
-                
+
                 inst = instances[instance_id]
                 inst["phase2b_msgs"].append(msg)
-                
+
                 if len(inst["phase2b_msgs"]) >= get_quorum(3):
                     if all(m["v_rnd"] == c_rnd for m in inst["phase2b_msgs"]):
                         v_val = inst["phase2b_msgs"][0]["v_val"]
                         decided_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
                         decided_values.add(decided_tuple)
                         pending_values.pop(0)
-                        
+
                         decision = create_decision_message(v_val, instance_id)
                         s.sendto(decision, config["learners"])
                         print(f"Proposer {id}: Decision reached for instance {instance_id}")
-                        
+
                         current_instance += 1
                         if pending_values:
                             start_instance(current_instance, pending_values[0])
-                        
+
                         inst["phase2b_msgs"] = []
-                
+
         except Exception as e:
             print(f"Proposer {id} error: {e}")
 
