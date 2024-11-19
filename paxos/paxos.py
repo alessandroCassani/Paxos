@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import sys
 import socket
 import struct
@@ -6,66 +7,52 @@ import json
 import math
 import time
 
-class Message:
-    PHASE1A = "PHASE1A"
-    PHASE1B = "PHASE1B"
-    PHASE2A = "PHASE2A"
-    PHASE2B = "PHASE2B"
-    DECISION = "DECISION"
-    PROPOSE = "PROPOSE"
+def create_phase1a_message(c_rnd, instance_id):
+    return json.dumps({
+        "type": "PHASE1A",
+        "c_rnd": c_rnd,
+        "instance": instance_id
+    }).encode()
 
-    @staticmethod
-    def phase1a(c_rnd, instance_id):
-        return json.dumps({
-            "type": Message.PHASE1A,
-            "c_rnd": c_rnd,
-            "instance": instance_id
-        }).encode()
+def create_phase1b_message(rnd, v_rnd, v_val, instance_id):
+    return json.dumps({
+        "type": "PHASE1B",
+        "rnd": rnd,
+        "v_rnd": v_rnd,
+        "v_val": v_val,
+        "instance": instance_id
+    }).encode()
 
-    @staticmethod
-    def phase1b(rnd, v_rnd, v_val, instance_id):
-        return json.dumps({
-            "type": Message.PHASE1B,
-            "rnd": rnd,
-            "v_rnd": v_rnd,
-            "v_val": v_val,
-            "instance": instance_id
-        }).encode()
+def create_phase2a_message(c_rnd, c_val, instance_id):
+    return json.dumps({
+        "type": "PHASE2A",
+        "c_rnd": c_rnd,
+        "c_val": c_val,
+        "instance": instance_id
+    }).encode()
 
-    @staticmethod
-    def phase2a(c_rnd, c_val, instance_id):
-        return json.dumps({
-            "type": Message.PHASE2A,
-            "c_rnd": c_rnd,
-            "c_val": c_val,
-            "instance": instance_id
-        }).encode()
+def create_phase2b_message(v_rnd, v_val, instance_id):
+    return json.dumps({
+        "type": "PHASE2B",
+        "v_rnd": v_rnd,
+        "v_val": v_val,
+        "instance": instance_id
+    }).encode()
 
-    @staticmethod
-    def phase2b(v_rnd, v_val, instance_id):
-        return json.dumps({
-            "type": Message.PHASE2B,
-            "v_rnd": v_rnd,
-            "v_val": v_val,
-            "instance": instance_id
-        }).encode()
+def create_decision_message(v_val, instance_id):
+    return json.dumps({
+        "type": "DECISION",
+        "v_val": v_val,
+        "instance": instance_id
+    }).encode()
 
-    @staticmethod
-    def decision(v_val, instance_id):
-        return json.dumps({
-            "type": Message.DECISION,
-            "v_val": v_val,
-            "instance": instance_id
-        }).encode()
-
-    @staticmethod
-    def propose(value, client_id, timestamp):
-        return json.dumps({
-            "type": Message.PROPOSE,
-            "value": value,
-            "client_id": client_id,
-            "timestamp": timestamp
-        }).encode()
+def create_propose_message(value, client_id, timestamp):
+    return json.dumps({
+        "type": "PROPOSE",
+        "value": value,
+        "client_id": client_id,
+        "timestamp": timestamp
+    }).encode()
 
 def mcast_receiver(hostport):
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -91,8 +78,8 @@ def get_quorum(n_acceptors):
 
 def acceptor(config, id):
     print(f"-> acceptor {id}")
-    states = {}  # Format: {instance_id: {"rnd": 0, "v_rnd": 0, "v_val": None}}
-    
+    states = {}
+
     r = mcast_receiver(config["acceptors"])
     s = mcast_sender()
     
@@ -107,17 +94,17 @@ def acceptor(config, id):
                 states[instance_id] = {"rnd": 0, "v_rnd": 0, "v_val": None}
                 print(f"Acceptor {id}: New instance {instance_id}")
 
-            if msg_type == Message.PHASE1A:
+            if msg_type == "PHASE1A":
                 c_rnd = msg["c_rnd"]
                 state = states[instance_id]
                 print(f"Acceptor {id}: PHASE1A for instance {instance_id}, c_rnd {c_rnd}")
                 
                 if c_rnd > state["rnd"]:
                     state["rnd"] = c_rnd
-                    phase1b = Message.phase1b(state["rnd"], state["v_rnd"], state["v_val"], instance_id)
+                    phase1b = create_phase1b_message(state["rnd"], state["v_rnd"], state["v_val"], instance_id)
                     s.sendto(phase1b, config["proposers"])
 
-            elif msg_type == Message.PHASE2A:
+            elif msg_type == "PHASE2A":
                 c_rnd = msg["c_rnd"]
                 c_val = msg["c_val"]
                 state = states[instance_id]
@@ -126,7 +113,7 @@ def acceptor(config, id):
                 if c_rnd >= state["rnd"]:
                     state["v_rnd"] = c_rnd
                     state["v_val"] = c_val
-                    phase2b = Message.phase2b(state["v_rnd"], state["v_val"], instance_id)
+                    phase2b = create_phase2b_message(state["v_rnd"], state["v_val"], instance_id)
                     s.sendto(phase2b, config["proposers"])
                     
         except Exception as e:
@@ -136,13 +123,13 @@ def proposer(config, id):
     print(f"-> proposer {id}")
     c_rnd = id
     current_instance = 0
-    pending_values = []  # List of tuples (value, client_id, timestamp)
-    decided_values = set()  # Set of tuples (value, client_id, timestamp)
-    instances = {}  # Format: {instance_id: {"c_val": (value, client_id, timestamp), "promises": [], "phase2b_msgs": []}}
-    
+    pending_values = []
+    decided_values = set()
+    instances = {}
+
     r = mcast_receiver(config["proposers"])
     s = mcast_sender()
-    
+
     def start_instance(instance_id, proposal_tuple):
         nonlocal c_rnd
         c_rnd += 100
@@ -157,7 +144,7 @@ def proposer(config, id):
             "phase2b_msgs": []
         }
         
-        phase1a = Message.phase1a(c_rnd, instance_id)
+        phase1a = create_phase1a_message(c_rnd, instance_id)
         s.sendto(phase1a, config["acceptors"])
         print(f"Proposer {id}: Started instance {instance_id} for value {proposal_tuple[0]}")
 
@@ -167,14 +154,14 @@ def proposer(config, id):
             msg = json.loads(data.decode())
             msg_type = msg["type"]
             
-            if msg_type == Message.PROPOSE:
+            if msg_type == "PROPOSE":
                 proposal = (msg["value"], msg["client_id"], msg["timestamp"])
                 if proposal not in decided_values:
                     pending_values.append(proposal)
                     if len(instances) == current_instance:
                         start_instance(current_instance, pending_values[0])
                 
-            elif msg_type == Message.PHASE1B:
+            elif msg_type == "PHASE1B":
                 instance_id = msg["instance"]
                 if instance_id != current_instance:
                     continue
@@ -191,11 +178,11 @@ def proposer(config, id):
                     else:
                         c_val = next(p["v_val"] for p in promises if p["v_rnd"] == k)
                     
-                    phase2a = Message.phase2a(c_rnd, c_val, instance_id)
+                    phase2a = create_phase2a_message(c_rnd, c_val, instance_id)
                     s.sendto(phase2a, config["acceptors"])
                     inst["promises"] = []
                 
-            elif msg_type == Message.PHASE2B:
+            elif msg_type == "PHASE2B":
                 instance_id = msg["instance"]
                 if instance_id != current_instance:
                     continue
@@ -210,7 +197,7 @@ def proposer(config, id):
                         decided_values.add(decided_tuple)
                         pending_values.pop(0)
                         
-                        decision = Message.decision(v_val, instance_id)
+                        decision = create_decision_message(v_val, instance_id)
                         s.sendto(decision, config["learners"])
                         print(f"Proposer {id}: Decision reached for instance {instance_id}")
                         
@@ -225,7 +212,7 @@ def proposer(config, id):
 
 def learner(config, id):
     r = mcast_receiver(config["learners"])
-    learned = {}  # Format: {instance_id: (value, client_id, timestamp)}
+    learned = {}
     current_instance = 0
     
     while True:
@@ -233,7 +220,7 @@ def learner(config, id):
             data = r.recv(2**16)
             msg = json.loads(data.decode())
             
-            if msg["type"] == Message.DECISION:
+            if msg["type"] == "DECISION":
                 instance_id = msg["instance"]
                 v_val = msg["v_val"]
                 value_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
@@ -259,7 +246,7 @@ def client(config, id):
     
     for value in values:
         timestamp = int(time.time() * 1_000_000)  
-        proposal = Message.propose(value, id, timestamp)
+        proposal = create_propose_message(value, id, timestamp)
         s.sendto(proposal, config["proposers"])
         print(f"Client {id} proposed: {value}")
         time.sleep(0.001)  
@@ -273,11 +260,10 @@ if __name__ == "__main__":
     id = int(sys.argv[3])
     
     if role == "acceptor":
-        rolefunc = acceptor
+        acceptor(config, id)
     elif role == "proposer":
-        rolefunc = proposer
+        proposer(config, id)
     elif role == "learner":
-        rolefunc = learner
+        learner(config, id)
     elif role == "client":
-        rolefunc = client
-    rolefunc(config, id)
+        client(config, id)
