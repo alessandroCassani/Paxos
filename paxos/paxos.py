@@ -11,7 +11,7 @@ def create_phase1a_message(c_rnd, instance_id):
     return json.dumps({
         "type": "PHASE1A",
         "c_rnd": c_rnd,
-        "instance": instance_id
+        "instance": list(instance_id)
     }).encode()
 
 def create_phase1b_message(rnd, v_rnd, v_val, instance_id):
@@ -20,7 +20,7 @@ def create_phase1b_message(rnd, v_rnd, v_val, instance_id):
         "rnd": rnd,
         "v_rnd": v_rnd,
         "v_val": v_val,
-        "instance": instance_id
+        "instance": list(instance_id)
     }).encode()
 
 def create_phase2a_message(c_rnd, c_val, instance_id):
@@ -28,7 +28,7 @@ def create_phase2a_message(c_rnd, c_val, instance_id):
         "type": "PHASE2A",
         "c_rnd": c_rnd,
         "c_val": c_val,
-        "instance": instance_id
+        "instance": list(instance_id)
     }).encode()
 
 def create_phase2b_message(v_rnd, v_val, instance_id):
@@ -36,14 +36,14 @@ def create_phase2b_message(v_rnd, v_val, instance_id):
         "type": "PHASE2B",
         "v_rnd": v_rnd,
         "v_val": v_val,
-        "instance": instance_id
+        "instance": list(instance_id)
     }).encode()
 
 def create_decision_message(v_val, instance_id):
     return json.dumps({
         "type": "DECISION",
         "v_val": v_val,
-        "instance": instance_id
+        "instance": list(instance_id)
     }).encode()
 
 def create_propose_message(value, client_id, timestamp):
@@ -88,9 +88,9 @@ def acceptor(config, id):
             data = r.recv(2**16)
             msg = json.loads(data.decode())
             msg_type = msg["type"]
-            instance_id = msg.get("instance")
+            instance_id = tuple(msg.get("instance", []))
 
-            if instance_id is not None and instance_id not in states:
+            if instance_id and instance_id not in states:
                 states[instance_id] = {"rnd": 0, "v_rnd": 0, "v_val": None}
                 print(f"Acceptor {id}: New instance {instance_id}")
 
@@ -118,8 +118,6 @@ def acceptor(config, id):
                     
         except Exception as e:
             print(f"Acceptor {id} error: {e}")
-
-import time
 
 def proposer(config, id):
     print(f"-> proposer {id}")
@@ -161,12 +159,13 @@ def proposer(config, id):
                 proposal = (msg["value"], msg["client_id"], msg["timestamp"])
                 if proposal not in decided_values:
                     pending_values.append(proposal)
-                    if len(instances) == current_instance:
-                        start_instance(current_instance, pending_values[0])
+                    if not instances:
+                        instance_id = (id, current_instance)
+                        start_instance(instance_id, pending_values[0])
 
             elif msg_type == "PHASE1B":
-                instance_id = msg["instance"]
-                if instance_id != current_instance:
+                instance_id = tuple(msg["instance"])
+                if instance_id[0] != id or instance_id[1] != current_instance:
                     continue
 
                 inst = instances[instance_id]
@@ -186,15 +185,15 @@ def proposer(config, id):
                     inst["promises"] = []
 
             elif msg_type == "PHASE2B":
-                instance_id = msg["instance"]
-                if instance_id != current_instance:
+                instance_id = tuple(msg["instance"])
+                if instance_id[0] != id or instance_id[1] != current_instance:
                     continue
 
                 inst = instances[instance_id]
-                inst["phase2b_msgs"].append(msg)
+                if msg["v_rnd"] == c_rnd:  # Only accept matching v_rnd
+                    inst["phase2b_msgs"].append(msg)
 
-                if len(inst["phase2b_msgs"]) >= get_quorum(3):
-                    if all(m["v_rnd"] == c_rnd for m in inst["phase2b_msgs"]):
+                    if len(inst["phase2b_msgs"]) >= get_quorum(3):
                         v_val = inst["phase2b_msgs"][0]["v_val"]
                         decided_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
                         decided_values.add(decided_tuple)
@@ -204,19 +203,20 @@ def proposer(config, id):
                         s.sendto(decision, config["learners"])
                         print(f"Proposer {id}: Decision reached for instance {instance_id}")
 
+                        del instances[instance_id]
+                        
                         current_instance += 1
+                        
                         if pending_values:
-                            start_instance(current_instance, pending_values[0])
-
-                        inst["phase2b_msgs"] = []
+                            new_instance_id = (id, current_instance)
+                            start_instance(new_instance_id, pending_values[0])
 
         except Exception as e:
             print(f"Proposer {id} error: {e}")
 
 def learner(config, id):
     r = mcast_receiver(config["learners"])
-    learned = {}
-    current_instance = 0
+    decisions_by_value = {}  # Track which proposers have decided each value
     
     while True:
         try:
@@ -224,15 +224,23 @@ def learner(config, id):
             msg = json.loads(data.decode())
             
             if msg["type"] == "DECISION":
-                instance_id = msg["instance"]
+                instance_id = tuple(msg["instance"])
                 v_val = msg["v_val"]
-                value_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
+                value = v_val["value"]
+                proposer_id = instance_id[0]
                 
-                if instance_id == current_instance and instance_id not in learned:
-                    learned[instance_id] = value_tuple
-                    print(value_tuple[0])
+                # Initialize tracking for this value if we haven't seen it
+                if value not in decisions_by_value:
+                    decisions_by_value[value] = set()
+                
+                # Add this proposer's decision
+                decisions_by_value[value].add(proposer_id)
+                
+                # Output only when both proposers have decided this value
+                if len(decisions_by_value[value]) == 2:
+                    print(value)
                     sys.stdout.flush()
-                    current_instance += 1
+                    del decisions_by_value[value]  # Clean up after outputting
                     
         except Exception as e:
             print(f"Learner {id} error: {e}")
@@ -248,11 +256,11 @@ def client(config, id):
     print(f"Client {id} will propose {len(values)} values")
     
     for value in values:
-        timestamp = int(time.time() * 1_000_000)  
+        timestamp = int(time.time() * 1_000_000)
         proposal = create_propose_message(value, id, timestamp)
         s.sendto(proposal, config["proposers"])
         print(f"Client {id} proposed: {value}")
-        time.sleep(0.001)  
+        time.sleep(0.001)
     
     print(f"Client {id} done.")
 
