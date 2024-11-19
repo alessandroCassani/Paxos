@@ -2,76 +2,72 @@
 import sys
 import socket
 import struct
-import time
-from collections import defaultdict
-import threading
 import json
 import math
+import time
 
 class Message:
-    PHASE1A = "PHASE_1A"
-    PHASE1B = "PHASE_1B"
-    PHASE2A = "PHASE_2A"
-    PHASE2B = "PHASE_2B"
-    CLIENT = "CLIENT_VALUE"
+    PHASE1A = "PHASE1A"
+    PHASE1B = "PHASE1B"
+    PHASE2A = "PHASE2A"
+    PHASE2B = "PHASE2B"
+    DECISION = "DECISION"
+    PROPOSE = "PROPOSE"
 
     @staticmethod
-    def prepare(c_rnd, key):
-        msg = {
-            "phase": Message.PHASE1A,
-            "c_rnd_1": c_rnd[0],
-            "c_rnd_2": c_rnd[1],
-            "key": key
-        }
-        return json.dumps(msg).encode()
+    def phase1a(c_rnd, instance_id):
+        return json.dumps({
+            "type": Message.PHASE1A,
+            "c_rnd": c_rnd,
+            "instance": instance_id
+        }).encode()
 
     @staticmethod
-    def promise(rnd, v_rnd, v_val, key):
-        msg = {
-            "phase": Message.PHASE1B,
-            "rnd_1": rnd[0],
-            "rnd_2": rnd[1],
-            "v_rnd_1": v_rnd[0] if v_rnd else None,
-            "v_rnd_2": v_rnd[1] if v_rnd else None,
+    def phase1b(rnd, v_rnd, v_val, instance_id):
+        return json.dumps({
+            "type": Message.PHASE1B,
+            "rnd": rnd,
+            "v_rnd": v_rnd,
             "v_val": v_val,
-            "key": key
-        }
-        return json.dumps(msg).encode()
+            "instance": instance_id
+        }).encode()
 
     @staticmethod
-    def accept(c_rnd, c_val, key):
-        msg = {
-            "phase": Message.PHASE2A,
-            "c_rnd_1": c_rnd[0],
-            "c_rnd_2": c_rnd[1],
+    def phase2a(c_rnd, c_val, instance_id):
+        return json.dumps({
+            "type": Message.PHASE2A,
+            "c_rnd": c_rnd,
             "c_val": c_val,
-            "key": key
-        }
-        return json.dumps(msg).encode()
+            "instance": instance_id
+        }).encode()
 
     @staticmethod
-    def decide(v_rnd, v_val, key):
-        msg = {
-            "phase": Message.PHASE2B,
-            "v_rnd_1": v_rnd[0],
-            "v_rnd_2": v_rnd[1],
+    def phase2b(v_rnd, v_val, instance_id):
+        return json.dumps({
+            "type": Message.PHASE2B,
+            "v_rnd": v_rnd,
             "v_val": v_val,
-            "key": key
-        }
-        return json.dumps(msg).encode()
+            "instance": instance_id
+        }).encode()
 
     @staticmethod
-    def client_value(value, client_id, timestamp):
-        msg = {
-            "phase": Message.CLIENT,
+    def decision(v_val, instance_id):
+        return json.dumps({
+            "type": Message.DECISION,
+            "v_val": v_val,
+            "instance": instance_id
+        }).encode()
+
+    @staticmethod
+    def propose(value, client_id, timestamp):
+        return json.dumps({
+            "type": Message.PROPOSE,
             "value": value,
-            "id": client_id,
+            "client_id": client_id,
             "timestamp": timestamp
-        }
-        return json.dumps(msg).encode()
+        }).encode()
 
 def mcast_receiver(hostport):
-    """create a multicast socket listening to the address"""
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     recv_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     recv_sock.bind(hostport)
@@ -80,7 +76,6 @@ def mcast_receiver(hostport):
     return recv_sock
 
 def mcast_sender():
-    """create a udp socket"""
     return socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
 
 def parse_cfg(cfgpath):
@@ -91,143 +86,185 @@ def parse_cfg(cfgpath):
             cfg[role] = (host, int(port))
     return cfg
 
-def get_quorum():
-    if len(active_acceptors) < 2:
-        return 0
-    else:
-        return math.ceil(len(active_acceptors) / 2)
+def get_quorum(n_acceptors):
+    return math.ceil((n_acceptors + 1) / 2)
 
-lock = threading.Lock()
-active_acceptors = set()
-
-def resend_prepare(key, prepare_msg, acceptors, sender):
-    sender.sendto(prepare_msg, acceptors)
-    print(f"Resending prepare message for key {key}")
-
-def acceptor(config, id):   
-    print("-> acceptor", id)
-    states = {}
-    with lock:
-        active_acceptors.add(id)
+def acceptor(config, id):
+    print(f"-> acceptor {id}")
+    states = {}  # Format: {instance_id: {"rnd": 0, "v_rnd": 0, "v_val": None}}
+    
     r = mcast_receiver(config["acceptors"])
     s = mcast_sender()
-    try:
-        while True:
-            msg = json.loads(r.recv(2**16).decode())
-            key = tuple(msg["key"]) if "key" in msg else None
-            c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
+    
+    while True:
+        try:
+            data = r.recv(2**16)
+            msg = json.loads(data.decode())
+            msg_type = msg["type"]
+            instance_id = msg.get("instance")
 
-            if msg["phase"] == Message.PHASE1A:
-                if key not in states:
-                    states[key] = {"rnd": (0, id), "v_rnd": None, "v_val": None}
+            if instance_id is not None and instance_id not in states:
+                states[instance_id] = {"rnd": 0, "v_rnd": 0, "v_val": None}
+                print(f"Acceptor {id}: New instance {instance_id}")
+
+            if msg_type == Message.PHASE1A:
+                c_rnd = msg["c_rnd"]
+                state = states[instance_id]
+                print(f"Acceptor {id}: PHASE1A for instance {instance_id}, c_rnd {c_rnd}")
+                
+                if c_rnd > state["rnd"]:
+                    state["rnd"] = c_rnd
+                    phase1b = Message.phase1b(state["rnd"], state["v_rnd"], state["v_val"], instance_id)
+                    s.sendto(phase1b, config["proposers"])
+
+            elif msg_type == Message.PHASE2A:
+                c_rnd = msg["c_rnd"]
+                c_val = msg["c_val"]
+                state = states[instance_id]
+                print(f"Acceptor {id}: PHASE2A for instance {instance_id}")
+                
+                if c_rnd >= state["rnd"]:
+                    state["v_rnd"] = c_rnd
+                    state["v_val"] = c_val
+                    phase2b = Message.phase2b(state["v_rnd"], state["v_val"], instance_id)
+                    s.sendto(phase2b, config["proposers"])
                     
-                if c_rnd > states[key]["rnd"]:
-                    states[key]["rnd"] = c_rnd
-                    promise = Message.promise(states[key]["rnd"], states[key]["v_rnd"], states[key]["v_val"], key)
-                    s.sendto(promise, config["proposers"])
-                    
-            elif msg["phase"] == Message.PHASE2A:
-                if c_rnd >= states[key]["rnd"]:
-                    states[key]["v_rnd"] = c_rnd
-                    states[key]["v_val"] = msg["c_val"]
-                    
-                    decide_msg = Message.decide(states[key]["v_rnd"], states[key]["v_val"], key)
-                    s.sendto(decide_msg, config["learners"])    
-                    s.sendto(decide_msg, config["proposers"])   # sends also to proposers leading to update the pending list (pop)
-    finally:
-        with lock:
-            active_acceptors.remove(id)
+        except Exception as e:
+            print(f"Acceptor {id} error: {e}")
 
 def proposer(config, id):
-    print("-> proposer", id)
+    print(f"-> proposer {id}")
+    c_rnd = id
+    current_instance = 0
+    pending_values = []  # List of tuples (value, client_id, timestamp)
+    decided_values = set()  # Set of tuples (value, client_id, timestamp)
+    instances = {}  # Format: {instance_id: {"c_val": (value, client_id, timestamp), "promises": [], "phase2b_msgs": []}}
+    
     r = mcast_receiver(config["proposers"])
     s = mcast_sender()
-    c_rnd_cnt = (0, id)  
-    c_rnd = {}
-    c_val = {}
-    promises = {}
-    pending = {}
-    pending_timers = {}
+    
+    def start_instance(instance_id, proposal_tuple):
+        nonlocal c_rnd
+        c_rnd += 100
+        
+        instances[instance_id] = {
+            "c_val": {
+                "value": proposal_tuple[0],
+                "client_id": proposal_tuple[1],
+                "timestamp": proposal_tuple[2]
+            },
+            "promises": [],
+            "phase2b_msgs": []
+        }
+        
+        phase1a = Message.phase1a(c_rnd, instance_id)
+        s.sendto(phase1a, config["acceptors"])
+        print(f"Proposer {id}: Started instance {instance_id} for value {proposal_tuple[0]}")
 
     while True:
-        msg = json.loads(r.recv(2**16).decode())
-        
-        phase = msg["phase"]
-        key = tuple(msg["key"]) if "key" in msg else None
-        rnd = (msg["rnd_1"], msg["rnd_2"]) if "rnd_1" in msg and "rnd_2" in msg else None
-        
-        if phase == Message.CLIENT:
-            key = (msg["timestamp"], msg["id"])
-            c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
-            c_rnd[key] = c_rnd_cnt
-            c_val[key] = msg["value"]
-            prepare_msg = Message.prepare(c_rnd[key], key)
-            pending[key] = time.time()  # a priori insert for the specific key the time since i start to work for it
-            pending_timers[key] = threading.Timer(5.0, resend_prepare, args=(key, prepare_msg, config["acceptors"], s))
-            pending_timers[key].start()
-            s.sendto(prepare_msg, config["acceptors"])
-
-        elif phase == Message.PHASE1B:
-            if key not in c_rnd or rnd != c_rnd[key]:  #c-rnd = rnd check
-                continue
-
-            if key not in promises:
-                promises[key] = []
-
-            promises[key].append(msg)
-            if len(promises[key]) > get_quorum() and get_quorum != 0:  # quorum check  (from Qa such that c-rnd = rnd now all checks done)
-                # Check if there are any valid v_rnd values
-                if any(p["v_rnd_1"] is not None and p["v_rnd_2"] is not None for p in promises[key]):
-                    k = max((p["v_rnd_1"], p["v_rnd_2"]) for p in promises[key] if p["v_rnd_1"] is not None and p["v_rnd_2"] is not None)
-                    if k:
-                        c_val[key] = next(
-                            p["v_val"] for p in promises[key] if (p["v_rnd_1"], p["v_rnd_2"]) == k
-                        )
-                accept_msg = Message.accept(c_rnd[key], c_val[key], key)
-                s.sendto(accept_msg, config["acceptors"])
-                promises[key] = []
-                if key in pending_timers:
-                    pending_timers[key].cancel()
-                    del pending_timers[key]
-                if key in pending:
-                    del pending[key]
-            else:
-                print('acceptors unavailables')
-
-        elif phase == Message.PHASE2B:
-            if key in pending:
-                del pending[key] # quorum received for decision, so can remove from the pending list
-            if key in pending_timers:
-                pending_timers[key].cancel()
-                del pending_timers[key]
+        try:
+            data = r.recv(2**16)
+            msg = json.loads(data.decode())
+            msg_type = msg["type"]
+            
+            if msg_type == Message.PROPOSE:
+                proposal = (msg["value"], msg["client_id"], msg["timestamp"])
+                if proposal not in decided_values:
+                    pending_values.append(proposal)
+                    if len(instances) == current_instance:
+                        start_instance(current_instance, pending_values[0])
+                
+            elif msg_type == Message.PHASE1B:
+                instance_id = msg["instance"]
+                if instance_id != current_instance:
+                    continue
+                
+                inst = instances[instance_id]
+                inst["promises"].append(msg)
+                
+                if len(inst["promises"]) >= get_quorum(3):
+                    promises = inst["promises"]
+                    k = max((p["v_rnd"] for p in promises), default=0)
+                    
+                    if k == 0:
+                        c_val = inst["c_val"]
+                    else:
+                        c_val = next(p["v_val"] for p in promises if p["v_rnd"] == k)
+                    
+                    phase2a = Message.phase2a(c_rnd, c_val, instance_id)
+                    s.sendto(phase2a, config["acceptors"])
+                    inst["promises"] = []
+                
+            elif msg_type == Message.PHASE2B:
+                instance_id = msg["instance"]
+                if instance_id != current_instance:
+                    continue
+                
+                inst = instances[instance_id]
+                inst["phase2b_msgs"].append(msg)
+                
+                if len(inst["phase2b_msgs"]) >= get_quorum(3):
+                    if all(m["v_rnd"] == c_rnd for m in inst["phase2b_msgs"]):
+                        v_val = inst["phase2b_msgs"][0]["v_val"]
+                        decided_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
+                        decided_values.add(decided_tuple)
+                        pending_values.pop(0)
+                        
+                        decision = Message.decision(v_val, instance_id)
+                        s.sendto(decision, config["learners"])
+                        print(f"Proposer {id}: Decision reached for instance {instance_id}")
+                        
+                        current_instance += 1
+                        if pending_values:
+                            start_instance(current_instance, pending_values[0])
+                        
+                        inst["phase2b_msgs"] = []
+                
+        except Exception as e:
+            print(f"Proposer {id} error: {e}")
 
 def learner(config, id):
     r = mcast_receiver(config["learners"])
-    learned = {}
-
+    learned = {}  # Format: {instance_id: (value, client_id, timestamp)}
+    current_instance = 0
+    
     while True:
-        msg = json.loads(r.recv(2**16).decode())
-        key = tuple(msg["key"]) if "key" in msg else None
-
-        if msg["phase"] == Message.PHASE2B:
-            if key not in learned:
-                learned[key] = msg["v_val"]
-                print(msg["v_val"])
-                sys.stdout.flush()
+        try:
+            data = r.recv(2**16)
+            msg = json.loads(data.decode())
+            
+            if msg["type"] == Message.DECISION:
+                instance_id = msg["instance"]
+                v_val = msg["v_val"]
+                value_tuple = (v_val["value"], v_val["client_id"], v_val["timestamp"])
+                
+                if instance_id == current_instance and instance_id not in learned:
+                    learned[instance_id] = value_tuple
+                    print(value_tuple[0])
+                    sys.stdout.flush()
+                    current_instance += 1
+                    
+        except Exception as e:
+            print(f"Learner {id} error: {e}")
 
 def client(config, id):
-    print(f"-> client {id} starting")
+    print(f"-> client {id}")
     s = mcast_sender()
     
+    values = []
     for value in sys.stdin:
-        value = value.strip()
-        current_time = time.time()
-        timestamp = int(current_time * 1_000_000)
-        client_msg = Message.client_value(value, id, timestamp)
-        s.sendto(client_msg, config["proposers"])
-        time.sleep(0.001)
+        values.append(value.strip())
     
-    print(f"Client {id} finished")
+    print(f"Client {id} will propose {len(values)} values")
+    
+    for value in values:
+        timestamp = int(time.time() * 1_000_000)  
+        proposal = Message.propose(value, id, timestamp)
+        s.sendto(proposal, config["proposers"])
+        print(f"Client {id} proposed: {value}")
+        time.sleep(0.001)  
+    
+    print(f"Client {id} done.")
 
 if __name__ == "__main__":
     cfgpath = sys.argv[1]
@@ -243,4 +280,4 @@ if __name__ == "__main__":
         rolefunc = learner
     elif role == "client":
         rolefunc = client
-    rolefunc(config, id)	
+    rolefunc(config, id)
