@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 import sys
 import socket
 import struct
@@ -68,23 +67,6 @@ def str_to_key(key_str):
         timestamp, client_id = key_str.split(":")
         return (int(timestamp), int(client_id))
     
-def start_retry_timer(key, c_rnd, sender, retry_timers):
-    if key not in retry_timers:
-        retry_timers[key] = threading.Timer(5.0, lambda: resend_phase1a(key, c_rnd, sender, retry_timers))
-        retry_timers[key].start()
-
-def resend_phase1a(key, c_rnd, sender, retry_timers):
-    phase1a = create_phase1a_message(c_rnd[key], key)
-    sender.sendto(phase1a, config["acceptors"])
-    print(f"Proposer: Retrying instance {key}")
-    if key in retry_timers:
-        retry_timers[key] = threading.Timer(1.0, lambda: resend_phase1a(key, c_rnd, sender, retry_timers))
-        retry_timers[key].start()
-
-def stop_retry_timer(key, retry_timers):
-    if key in retry_timers:
-        retry_timers[key].cancel()
-        del retry_timers[key]
 
 def mcast_receiver(hostport):
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -157,6 +139,14 @@ def acceptor(config, id):
         except Exception as e:
             print(f"Acceptor {id} error: {e}")
 
+def resend_propose(key, c_rnd, c_val, sender, retry_timers):
+    phase1a = create_phase1a_message(c_rnd[key], key)
+    sender.sendto(phase1a, config["acceptors"])
+    print(f"Proposer: Retrying propose for instance {key}")
+    if key in retry_timers:
+        retry_timers[key] = threading.Timer(5.0, lambda: resend_propose(key, c_rnd, c_val, sender, retry_timers))
+        retry_timers[key].start()
+
 def proposer(config, id):
     print(f"-> proposer {id}")
     r = mcast_receiver(config["proposers"])
@@ -176,40 +166,34 @@ def proposer(config, id):
             msg_type = msg["type"]
 
             if msg_type == "PROPOSE":
-                #print(f'proposer {id} received value: {msg["value"]}')
                 key = (msg["timestamp"], msg["client_id"])
                 
                 c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
                 c_rnd[key] = c_rnd_cnt
                 c_val[key] = msg["value"]
-                #print(f"Proposer {id}: Stored value {msg['value']} in c_val for key {key}")
                     
                 phase1a = create_phase1a_message(c_rnd[key], key)
                 s.sendto(phase1a, config["acceptors"])
-                #print(f"Proposer {id}: Started instance {key} for value {msg['value']}")
                 
-                start_retry_timer(key, c_rnd, s, retry_timers)
+                retry_timers[key] = threading.Timer(5.0, lambda: resend_propose(key, c_rnd, c_val, s, retry_timers))
+                retry_timers[key].start()
 
             elif msg_type == "PHASE1B":
                 key = parse_instance_key(msg)
-                    
                 msg_rnd = (msg["rnd_1"], msg["rnd_2"])
                 
-                if key in c_rnd and msg_rnd == c_rnd[key]:
+                if key in c_rnd and msg_rnd == c_rnd[key]:                        
                     promises[key].append({
                         "v_rnd": (msg["v_rnd_1"], msg["v_rnd_2"]) if msg["v_rnd_1"] is not None else None,
                         "v_val": msg["v_val"]
                     })
                     
-                    if len(promises[key]) >= get_quorum(3): #remember to fix quorum!!
+                    if len(promises[key]) >= get_quorum(3):
                         valid_promises = [p for p in promises[key] if p["v_rnd"] is not None and p["v_val"] is not None]
                         
                         if valid_promises:  
                             highest_promise = max(valid_promises, key=lambda p: p["v_rnd"])
                             c_val[key] = highest_promise["v_val"]
-                            print(f"Proposer {id}: Using value {c_val[key]} from highest promise")
-                        
-                        #else the c_val is the one which the proposer has initialized in phase1A
                         
                         phase2a = create_phase2a_message(c_rnd[key], c_val[key], key)
                         s.sendto(phase2a, config["acceptors"])
@@ -217,19 +201,20 @@ def proposer(config, id):
 
             elif msg_type == "PHASE2B":
                 key = parse_instance_key(msg)
-                    
                 msg_v_rnd = (msg["v_rnd_1"], msg["v_rnd_2"])
                 
                 if key in c_rnd and msg_v_rnd == c_rnd[key]:
                     phase2b_msgs[key].append(msg["v_val"])
 
                     if len(phase2b_msgs[key]) >= get_quorum(3):
-                        # now i have the quorum, i can decide
-                        print(f"Proposer {id}: Creating decision with value {c_val[key]} for instance {key}")
+                        # Cancel retry timer when we get Phase2B quorum
+                        if key in retry_timers:
+                            retry_timers[key].cancel()
+                            del retry_timers[key]
+                            
                         decision = create_decision_message(c_val[key], key)
                         s.sendto(decision, config["learners"])
                         print(f"Proposer {id}: Decision reached for instance {key}")
-                        stop_retry_timer(key, retry_timers) #stop the retry timer
 
         except Exception as e:
             print(f"Proposer {id} error: {str(e)}")
