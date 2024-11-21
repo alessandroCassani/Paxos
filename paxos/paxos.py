@@ -7,13 +7,14 @@ import json
 import math
 import time
 from collections import defaultdict
+import threading
 
 def create_phase1a_message(c_rnd, key):
     return json.dumps({
         "type": "PHASE1A",
         "c_rnd_1": c_rnd[0],
         "c_rnd_2": c_rnd[1],
-        "instance": [str(key[0]), str(key[1])]  # Convert numbers to strings explicitly
+        "instance": [str(key[0]), str(key[1])]  
     }).encode()
 
 def create_phase1b_message(rnd, v_rnd, v_val, key):
@@ -24,7 +25,7 @@ def create_phase1b_message(rnd, v_rnd, v_val, key):
         "v_rnd_1": v_rnd[0] if v_rnd else None,
         "v_rnd_2": v_rnd[1] if v_rnd else None,
         "v_val": v_val,
-        "instance": [str(key[0]), str(key[1])]  # Convert numbers to strings explicitly
+        "instance": [str(key[0]), str(key[1])]  
     }).encode()
 
 def create_phase2a_message(c_rnd, c_val, key):
@@ -33,7 +34,7 @@ def create_phase2a_message(c_rnd, c_val, key):
         "c_rnd_1": c_rnd[0],
         "c_rnd_2": c_rnd[1],
         "c_val": c_val,
-        "instance": [str(key[0]), str(key[1])]  # Convert numbers to strings explicitly
+        "instance": [str(key[0]), str(key[1])]  
     }).encode()
 
 def create_phase2b_message(v_rnd, v_val, key):
@@ -42,14 +43,14 @@ def create_phase2b_message(v_rnd, v_val, key):
         "v_rnd_1": v_rnd[0],
         "v_rnd_2": v_rnd[1],
         "v_val": v_val,
-        "instance": [str(key[0]), str(key[1])]  # Convert numbers to strings explicitly
+        "instance": [str(key[0]), str(key[1])]  
     }).encode()
 
 def create_decision_message(v_val, key):
     return json.dumps({
         "type": "DECISION",
         "v_val": v_val,
-        "instance": [str(key[0]), str(key[1])]  # Convert numbers to strings explicitly
+        "instance": [str(key[0]), str(key[1])] 
     }).encode()
 
 def create_propose_message(value, client_id, timestamp):
@@ -61,13 +62,29 @@ def create_propose_message(value, client_id, timestamp):
     }).encode()
     
 def key_to_str(key_tuple):
-        """Convert a tuple key to a string representation"""
         return f"{key_tuple[0]}:{key_tuple[1]}"
     
 def str_to_key(key_str):
-        """Convert a string key back to a tuple"""
         timestamp, client_id = key_str.split(":")
         return (int(timestamp), int(client_id))
+    
+def start_retry_timer(key, c_rnd, sender, retry_timers):
+    if key not in retry_timers:
+        retry_timers[key] = threading.Timer(5.0, lambda: resend_phase1a(key, c_rnd, sender, retry_timers))
+        retry_timers[key].start()
+
+def resend_phase1a(key, c_rnd, sender, retry_timers):
+    phase1a = create_phase1a_message(c_rnd[key], key)
+    sender.sendto(phase1a, config["acceptors"])
+    print(f"Proposer: Retrying instance {key}")
+    if key in retry_timers:
+        retry_timers[key] = threading.Timer(1.0, lambda: resend_phase1a(key, c_rnd, sender, retry_timers))
+        retry_timers[key].start()
+
+def stop_retry_timer(key, retry_timers):
+    if key in retry_timers:
+        retry_timers[key].cancel()
+        del retry_timers[key]
 
 def mcast_receiver(hostport):
     recv_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -88,7 +105,13 @@ def parse_cfg(cfgpath):
             cfg[role] = (host, int(port))
     return cfg
 
-def get_quorum(n_acceptors):
+def parse_instance_key(msg):
+        instance = msg.get("instance", [])
+        if len(instance) == 2:
+            return (int(instance[0]), int(instance[1]))  
+        return None
+
+def get_quorum(n_acceptors):     #fixed number of acceptors. to modify at runtime!!
     return math.ceil((n_acceptors + 1) / 2)
 
 def acceptor(config, id):
@@ -98,13 +121,6 @@ def acceptor(config, id):
     r = mcast_receiver(config["acceptors"])
     s = mcast_sender()
     
-    def parse_instance_key(msg):
-        """Parse instance key from message consistently"""
-        instance = msg.get("instance", [])
-        if len(instance) == 2:
-            return (int(instance[0]), int(instance[1]))  # Convert back to integers
-        return None
-    
     while True:
         try:
             data = r.recv(2**16)
@@ -112,14 +128,14 @@ def acceptor(config, id):
             msg_type = msg["type"]
             key = parse_instance_key(msg)
             
-            if key and key not in states:
+            if key and key not in states:  #initialize
                 states[key] = {"rnd": (0, 0), "v_rnd": (0, 0), "v_val": None}
                 print(f"Acceptor {id}: New instance {key}")
             
-            if msg_type == "PHASE1A" and key:
+            if msg_type == "PHASE1A":
                 c_rnd = (msg["c_rnd_1"], msg["c_rnd_2"])
                 state = states[key]
-                print(f"Acceptor {id}: PHASE1A for instance {key}, c_rnd {c_rnd}")
+                #print(f"Acceptor {id}: PHASE1A for instance {key}, c_rnd {c_rnd}")
                 
                 if c_rnd > state["rnd"]:
                     state["rnd"] = c_rnd
@@ -147,18 +163,11 @@ def proposer(config, id):
     s = mcast_sender()
     
     c_rnd_cnt = (0, id)
-    c_rnd = {}  # (timestamp, client_id) -> round number
-    c_val = {}  # (timestamp, client_id) -> value
-    promises = defaultdict(list)  # (timestamp, client_id) -> list of promises
-    instances = {}  # (timestamp, client_id) -> instance info
-    phase2b_msgs = defaultdict(list)  # (timestamp, client_id) -> list of phase 2b messages
-    
-    def parse_instance_key(msg):
-        """Parse instance key from message consistently"""
-        instance = msg.get("instance", [])
-        if len(instance) == 2:
-            return (int(instance[0]), int(instance[1]))
-        return None
+    c_rnd = {}  
+    c_val = {} 
+    promises = defaultdict(list)  
+    phase2b_msgs = defaultdict(list) 
+    retry_timers = {}
     
     while True:
         try:
@@ -167,26 +176,22 @@ def proposer(config, id):
             msg_type = msg["type"]
 
             if msg_type == "PROPOSE":
+                #print(f'proposer {id} received value: {msg["value"]}')
                 key = (msg["timestamp"], msg["client_id"])
                 
-                c_rnd_cnt = (c_rnd_cnt[0] + 100, c_rnd_cnt[1])
+                c_rnd_cnt = (c_rnd_cnt[0] + 1, c_rnd_cnt[1])
                 c_rnd[key] = c_rnd_cnt
-    
-                instances[key] = {
-                    "c_val": msg["value"],
-                    "client_id": msg["client_id"],
-                    "timestamp": msg["timestamp"],
-                    "start_time": time.time()
-                }
+                c_val[key] = msg["value"]
+                #print(f"Proposer {id}: Stored value {msg['value']} in c_val for key {key}")
                     
                 phase1a = create_phase1a_message(c_rnd[key], key)
                 s.sendto(phase1a, config["acceptors"])
-                print(f"Proposer {id}: Started instance {key} for value {msg['value']}")
+                #print(f"Proposer {id}: Started instance {key} for value {msg['value']}")
+                
+                start_retry_timer(key, c_rnd, s, retry_timers)
 
             elif msg_type == "PHASE1B":
                 key = parse_instance_key(msg)
-                if not key:
-                    continue
                     
                 msg_rnd = (msg["rnd_1"], msg["rnd_2"])
                 
@@ -196,42 +201,35 @@ def proposer(config, id):
                         "v_val": msg["v_val"]
                     })
                     
-                    if len(promises[key]) >= get_quorum(3):
-                        # Find highest v_rnd among received promises
-                        highest_promise = max(
-                            (p for p in promises[key] if p["v_rnd"] is not None),
-                            key=lambda p: p["v_rnd"],
-                            default=None
-                        )
+                    if len(promises[key]) >= get_quorum(3): #remember to fix quorum!!
+                        valid_promises = [p for p in promises[key] if p["v_rnd"] is not None and p["v_val"] is not None]
                         
-                        # If any accepted values exist, choose the one with highest v_rnd
-                        if highest_promise:
+                        if valid_promises:  
+                            highest_promise = max(valid_promises, key=lambda p: p["v_rnd"])
                             c_val[key] = highest_promise["v_val"]
-                        else:
-                            # No accepted values, use the original proposed value
-                            c_val[key] = instances[key]["c_val"]
-
+                            print(f"Proposer {id}: Using value {c_val[key]} from highest promise")
+                        
+                        #else the c_val is the one which the proposer has initialized in phase1A
+                        
                         phase2a = create_phase2a_message(c_rnd[key], c_val[key], key)
                         s.sendto(phase2a, config["acceptors"])
-                        promises[key] = []  # Clear promises after Phase 2a
+                        promises[key] = []
 
             elif msg_type == "PHASE2B":
                 key = parse_instance_key(msg)
-                if not key:
-                    continue
                     
                 msg_v_rnd = (msg["v_rnd_1"], msg["v_rnd_2"])
                 
                 if key in c_rnd and msg_v_rnd == c_rnd[key]:
-                    phase2b_msgs[key].append({
-                        "v_val": msg["v_val"]
-                    })
+                    phase2b_msgs[key].append(msg["v_val"])
 
                     if len(phase2b_msgs[key]) >= get_quorum(3):
-                        decision = create_decision_message(phase2b_msgs[key][0]["v_val"], key)
+                        # now i have the quorum, i can decide
+                        print(f"Proposer {id}: Creating decision with value {c_val[key]} for instance {key}")
+                        decision = create_decision_message(c_val[key], key)
                         s.sendto(decision, config["learners"])
                         print(f"Proposer {id}: Decision reached for instance {key}")
-                        phase2b_msgs[key] = []  # Clear messages after decision
+                        stop_retry_timer(key, retry_timers) #stop the retry timer
 
         except Exception as e:
             print(f"Proposer {id} error: {str(e)}")
@@ -239,24 +237,28 @@ def proposer(config, id):
 def learner(config, id):
     r = mcast_receiver(config["learners"])
     instance_decisions = {}
-    output_sequence = set()
     
     while True:
         try:
             data = r.recv(2**16)
+           # print(f"Learner {id}: Received data: {data.decode()}")  # Debug raw message
             msg = json.loads(data.decode())
+            #print(f"Learner {id}: Parsed message type: {msg['type']}")  # Debug message type
             
             if msg["type"] == "DECISION":
-                instance_key = tuple(msg["instance"])
-                value = msg["v_val"]["value"]
+                instance_key = parse_instance_key(msg)
+                #print(f"Learner {id}: Decision for instance {instance_key}")  # Debug instance
                 
                 if instance_key not in instance_decisions:
+                    value = msg["v_val"]
                     instance_decisions[instance_key] = value
-                    
-                    if instance_key not in output_sequence:
-                        output_sequence.add(instance_key)
-                        print(value)
-                        sys.stdout.flush()
+                    print(value)  # Final output
+                    sys.stdout.flush()
+               # else:
+                    #if not instance_key:
+                        #print(f"Learner {id}: Failed to parse instance key from {msg.get('instance')}")
+                    #else:
+                        #print(f"Learner {id}: Already saw instance {instance_key}")
                     
         except Exception as e:
             print(f"Learner {id} error: {str(e)}")
@@ -286,9 +288,5 @@ if __name__ == "__main__":
         "learner": learner,
         "client": client
     }
-    
-    if role not in role_funcs:
-        print(f"Invalid role: {role}")
-        sys.exit(1)
         
     role_funcs[role](config, id)
