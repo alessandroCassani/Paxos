@@ -85,10 +85,14 @@ def create_propose_message(value, client_id):
 
 def parse_cfg(cfgpath):
     cfg = {}
+    acceptor_count = 0
     with open(cfgpath, "r") as cfgfile:
         for line in cfgfile:
             (role, host, port) = line.split()
+            if role.startswith('acceptor'):
+                acceptor_count += 1
             cfg[role] = (host, int(port))
+    cfg['acceptor_count'] = acceptor_count
     logging.debug(f"Parsed config: {cfg}")
     return cfg
 
@@ -169,39 +173,47 @@ def proposer(config, id):
     logger = logging.getLogger(f"Proposer-{id}")
     logger.info(f"Starting proposer {id}")
     
-    # Add random startup delay to improve concurrency
-    time.sleep(random.uniform(0, 0.1))
-    
     r = mcast_receiver(config["proposers"])
     r.setblocking(False)
     s = mcast_sender()
     
-    c_rnd = (0, id)  # Initial round number unique to this proposer
-    instance = 0     # Current instance number
-    pending_values = []  # Values waiting to be proposed (value, client_id)
-    promises = defaultdict(list)  # Phase 1B promises received
-    phase2b_msgs = defaultdict(list)  # Phase 2B messages received
-    decided = set()  # Instances that have been decided
-    instance_attempts = defaultdict(int)  # Number of attempts per instance
-    last_attempt = 0  # Timestamp of last attempt
+    TOTAL_ACCEPTORS = config['acceptor_count']
+    QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
+    PHASE_TIMEOUT = 5.0  
+    INITIAL_TIMEOUT = 2.0
     
-    INITIAL_TIMEOUT = 1.0
-    MAX_TIMEOUT = 4.0
+    logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
     
-    def get_timeout(instance):
-        # Exponential backoff based on number of attempts
-        attempts = instance_attempts[instance]
-        return min(INITIAL_TIMEOUT * (1.5 ** attempts), MAX_TIMEOUT)
+    c_rnd = (0, id)
+    instance = 0
+    pending_values = []
+    promises = defaultdict(list)
+    phase2b_msgs = defaultdict(list)
+    decided = set()
+    last_attempt = 0
+    phase_start_time = None
+    
+    def check_liveness():
+        nonlocal phase_start_time
+        if phase_start_time and time.time() - phase_start_time > PHASE_TIMEOUT:
+            logger.warning(f"Timeout waiting for quorum responses. Only received "
+                         f"{len(promises[instance])} promises or "
+                         f"{len(phase2b_msgs[instance])} phase2b messages. "
+                         f"Need {QUORUM_SIZE} out of {TOTAL_ACCEPTORS} acceptors.")
+            return False
+        return True
     
     def start_phase1():
-        nonlocal last_attempt
-        if pending_values:  # Make sure we have values to propose
-            client_id = pending_values[0][1]  # Extract client_id from pending value
+        nonlocal last_attempt, phase_start_time
+        if pending_values:
+            client_id = pending_values[0][1]
             logger.debug(f"Starting Phase 1 for instance {instance} with c_rnd {c_rnd}")
             phase1a = create_phase1a_message(c_rnd, instance, client_id)
             s.sendto(phase1a, config["acceptors"])
             last_attempt = time.time()
-            instance_attempts[instance] += 1
+            phase_start_time = time.time()
+            promises[instance].clear()
+            phase2b_msgs[instance].clear()
     
     while True:
         try:
@@ -209,122 +221,129 @@ def proposer(config, id):
             msg = json.loads(data.decode())
             msg_type = msg["type"]
             
-            logger.debug(f"Received message: type={msg_type}")
-            
             if msg_type == "PROPOSE":
                 value_tuple = (msg["value"], msg["client_id"])
-                logger.debug(f"Received PROPOSE: value={value_tuple}")
-                
-                if not pending_values:
-                    logger.debug("No pending values, starting Phase 1")
-                    pending_values.append(value_tuple)
+                pending_values.append(value_tuple)
+                if len(pending_values) == 1:
                     start_phase1()
-                else:
-                    logger.debug(f"Adding to pending values: {value_tuple}")
-                    pending_values.append(value_tuple)
-                    
+            
             elif msg_type == "PHASE1B":
                 msg_instance = msg["slot"]
                 msg_rnd = (msg["rnd_1"], msg["rnd_2"])
-                logger.debug(f"Received PHASE1B for instance {msg_instance}, rnd={msg_rnd}")
                 
-                if msg_rnd == c_rnd and msg_instance == instance:
-                    v_val = msg["v_val"]
-                    if isinstance(v_val, list):
-                        v_val = tuple(v_val)
-                        
-                    promises[instance].append({
-                        "v_rnd": (msg["v_rnd_1"], msg["v_rnd_2"]) if msg["v_rnd_1"] is not None else None,
-                        "v_val": v_val
-                    })
+                # Check if this is a response to our current round
+                if msg_instance == instance:
+                    # If we got rejected (received round higher than ours)
+                    if msg_rnd > c_rnd:
+                        logger.debug(f"Our round {c_rnd} was rejected, got higher round {msg_rnd}")
+                        c_rnd = (msg_rnd[0] + 1, id)  # Increment higher than the received round
+                        start_phase1()  # Retry same instance with higher round
+                        continue
                     
-                    logger.debug(f"Promises for instance {instance}: {len(promises[instance])}/{get_quorum(3)}")
-                    
-                    if len(promises[instance]) >= get_quorum(3):
-                        valid_promises = [p for p in promises[instance] if p["v_rnd"] is not None and p["v_val"] is not None]
-                        logger.debug(f"Reached quorum. Valid promises: {valid_promises}")
-                        
-                        if valid_promises:
-                            # Must propose the highest numbered value
-                            highest_promise = max(valid_promises, key=lambda p: p["v_rnd"])
-                            c_val = highest_promise["v_val"]
-                            logger.debug(f"Using highest promise value: {c_val}")
-                        else:
-                            # Free to propose our value
-                            if pending_values:
-                                c_val = pending_values[0]
-                                logger.debug(f"No valid promises, proposing new value: {c_val}")
+                    # If this is a response to our current round
+                    if msg_rnd == c_rnd:
+                        v_val = msg["v_val"]
+                        if isinstance(v_val, list):
+                            v_val = tuple(v_val)
                             
-                        if pending_values:  # Make sure we still have pending values
-                            client_id = pending_values[0][1]  # Get client_id from pending value
+                        promises[instance].append({
+                            "v_rnd": (msg["v_rnd_1"], msg["v_rnd_2"]) if msg["v_rnd_1"] is not None else None,
+                            "v_val": v_val
+                        })
+                        
+                        logger.debug(f"Received {len(promises[instance])}/{QUORUM_SIZE} promises for instance {instance}")
+                        
+                        if len(promises[instance]) >= QUORUM_SIZE and check_liveness():
+                            # Find highest numbered value among responses
+                            valid_promises = [p for p in promises[instance] 
+                                           if p["v_rnd"] is not None and p["v_val"] is not None]
+                            
+                            if valid_promises:
+                                # Must propose highest numbered value to preserve consensus
+                                highest_promise = max(valid_promises, key=lambda p: p["v_rnd"])
+                                c_val = highest_promise["v_val"]
+                                logger.debug(f"Found existing value in instance {instance}, must propose: {c_val}")
+                            else:
+                                # Free to propose our value
+                                c_val = pending_values[0]
+                                logger.debug(f"Instance {instance} is empty, proposing our value: {c_val}")
+                            
+                            client_id = pending_values[0][1]
                             phase2a = create_phase2a_message(c_rnd, c_val, instance, client_id)
                             s.sendto(phase2a, config["acceptors"])
-                            promises[instance].clear()
-                        
+                            phase_start_time = time.time()
+            
             elif msg_type == "PHASE2B":
                 msg_instance = msg["slot"]
                 msg_v_rnd = (msg["v_rnd_1"], msg["v_rnd_2"])
-                logger.debug(f"Received PHASE2B for instance {msg_instance}, v_rnd={msg_v_rnd}")
                 
-                if msg_v_rnd == c_rnd and msg_instance == instance:
+                # Check if we got rejected
+                if msg_instance == instance and msg_v_rnd > c_rnd:
+                    logger.debug(f"Our round {c_rnd} was rejected in phase 2, got higher round {msg_v_rnd}")
+                    c_rnd = (msg_v_rnd[0] + 1, id)  # Increment higher than the received round
+                    start_phase1()  # Retry same instance with higher round
+                    continue
+                
+                if msg_instance == instance and msg_v_rnd == c_rnd:
                     value = msg["v_val"]
                     if isinstance(value, list):
                         value = tuple(value)
                     phase2b_msgs[instance].append(value)
                     
-                    logger.debug(f"Phase2B messages for instance {instance}: {len(phase2b_msgs[instance])}/{get_quorum(3)}")
+                    logger.debug(f"Received {len(phase2b_msgs[instance])}/{QUORUM_SIZE} phase2b messages for instance {instance}")
                     
-                    if len(phase2b_msgs[instance]) >= get_quorum(3):
+                    if len(phase2b_msgs[instance]) >= QUORUM_SIZE and check_liveness():
                         value_counts = {}
                         for v in phase2b_msgs[instance]:
                             if isinstance(v, list):
                                 v = tuple(v)
                             value_counts[v] = value_counts.get(v, 0) + 1
-                            
-                        majority_value = max(value_counts.items(), key=lambda x: x[1])[0]
-                        logger.debug(f"Reached quorum with majority value: {majority_value}")
                         
-                        if instance not in decided:
-                            decided.add(instance)
+                        majority_count = max(value_counts.values())
+                        if majority_count >= QUORUM_SIZE:
+                            majority_value = max(
+                                (v for v, c in value_counts.items() if c == majority_count)
+                            )
+                            
+                            # Send decision
                             decision = create_decision_message(majority_value, instance)
                             s.sendto(decision, config["learners"])
-                            logger.debug(f"Sent decision for instance {instance}")
                             
-                            # Clear state for this instance
-                            promises[instance].clear()
-                            phase2b_msgs[instance].clear()
-                            
-                            # Remove value if it was ours
-                            if majority_value == pending_values[0]:
-                                pending_values.pop(0)
-                                logger.debug("Removed decided value from pending values")
-                            
-                            # Move to next instance
-                            instance += 1
-                            c_rnd = (0, id)  # Reset round number for new instance
-                            logger.debug(f"Moving to instance {instance}")
-                            
-                            # Start next instance if we have more values
-                            if pending_values:
-                                start_phase1()
+                            # Only advance to next instance after successfully deciding current one
+                            if instance not in decided:
+                                decided.add(instance)
+                                # Remove our value from pending if it was the one decided
+                                if majority_value == pending_values[0]:
+                                    pending_values.pop(0)
+                                # Move to next instance
+                                instance += 1
+                                c_rnd = (0, id)  # Reset round for new instance
+                                if pending_values:  # If we still have values to propose
+                                    start_phase1()
             
             elif msg_type == "DECISION":
                 decided_instance = msg["slot"]
-                logger.debug(f"Received DECISION for instance {decided_instance}")
-                if decided_instance >= instance:
-                    instance = decided_instance + 1
-                    logger.debug(f"Updated instance to {instance}")
-                    if pending_values:
+                decided_value = msg["v_val"]
+                if decided_instance not in decided:
+                    decided.add(decided_instance)
+                    # If this was our instance and value, remove it from pending
+                    if pending_values and decided_value == pending_values[0]:
+                        pending_values.pop(0)
+                    # Move to next instance if we were working on this one
+                    if decided_instance == instance:
+                        instance += 1
                         c_rnd = (0, id)
-                        start_phase1()
-                                
+                        if pending_values:
+                            start_phase1()
+                
         except BlockingIOError:
-            # Handle timeouts with exponential backoff
-            current_timeout = get_timeout(instance)
-            if pending_values and time.time() - last_attempt > current_timeout and instance not in decided:
-                logger.debug(f"Timeout occurred. Incrementing c_rnd for instance {instance}")
-                c_rnd = (c_rnd[0] + 1, c_rnd[1])
-                start_phase1()
+            # If we haven't heard back in a while, retry with higher round number
+            if pending_values and time.time() - last_attempt > INITIAL_TIMEOUT and instance not in decided:
+                if check_liveness():
+                    c_rnd = (c_rnd[0] + 1, c_rnd[1])
+                    start_phase1()  # Retry same instance with higher round
+                else:
+                    logger.warning(f"Cannot make progress: not enough acceptors responding (need {QUORUM_SIZE} out of {TOTAL_ACCEPTORS})")
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
 
@@ -332,36 +351,54 @@ def learner(config, id):
     logger = logging.getLogger(f"Learner-{id}")
     logger.info(f"Starting learner {id}")
     
+    TOTAL_ACCEPTORS = config['acceptor_count']
+    QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
+    
+    logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
+    
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
+    decisions = defaultdict(dict)  # slot -> (value -> count)
+    confirmed_decisions = set()  # Track confirmed decisions
+    
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
     s.sendto(catchup_request, config["acceptors"])
-    printed_values = set()
-    decisions = {}
-
+    
     logger.info("Sent initial CATCHUP request")
-
+    
     while True:
         try:
             data = r.recv(2**16)
             msg = json.loads(data.decode())
+            
             if msg["type"] == "DECISION":
+                instance = msg["slot"]
                 value_tuple = msg["v_val"]
-                if (value_tuple[0], value_tuple[1]) not in printed_values:
-                    print(f"{value_tuple[0]}")
-                    printed_values.add((value_tuple[0], value_tuple[1]))
-                    sys.stdout.flush()
-
+                
+                # Count identical decisions
+                decisions[instance][str(value_tuple)] = decisions[instance].get(str(value_tuple), 0) + 1
+                
+                # Only accept and print decision when we have a quorum of identical values
+                if instance not in confirmed_decisions:
+                    for value, count in decisions[instance].items():
+                        if count >= QUORUM_SIZE:
+                            print(f"{eval(value)[0]}")
+                            sys.stdout.flush()
+                            confirmed_decisions.add(instance)
+                            break
+            
             elif msg["type"] == "CATCHUP":
                 decided = msg.get("decided", {})
                 for slot, (value_tuple, client_id) in sorted(decided.items(), key=lambda x: int(x[0])):
-                    if (value_tuple[0], client_id) not in printed_values:
-                        print(f"{value_tuple[0]}")
-                        printed_values.add((value_tuple[0], client_id))
-                        sys.stdout.flush()
-
+                    if int(slot) not in confirmed_decisions:
+                        decisions[slot][str(value_tuple)] = decisions[slot].get(str(value_tuple), 0) + 1
+                        if decisions[slot][str(value_tuple)] >= QUORUM_SIZE:
+                            print(f"{value_tuple[0]}")
+                            sys.stdout.flush()
+                            confirmed_decisions.add(int(slot))
+            
         except Exception as e:
-            logger.error(f"Learner {id} error: {e}")
+            logger.error(f"Learner {id} error: {e}", exc_info=True)
 
 def client(config, id):
     logger = logging.getLogger(f"Client-{id}")
@@ -373,6 +410,7 @@ def client(config, id):
         proposal = create_propose_message(value, id)
         s.sendto(proposal, config["proposers"])
         logger.debug(f"Sent proposal with value: {value}")
+        time.sleep(0.001)
     
     logger.info(f"Client {id} finished")
 
