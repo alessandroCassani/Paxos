@@ -178,8 +178,8 @@ def proposer(config, id):
     
     TOTAL_ACCEPTORS = config['acceptor_count']
     QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
-    PHASE_TIMEOUT = 1.0  
-    INITIAL_TIMEOUT = 0.5
+    PHASE_TIMEOUT = 0.5  
+    INITIAL_TIMEOUT = 0.2
     
     logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
     
@@ -335,15 +335,9 @@ def learner(config, id):
     logger = logging.getLogger(f"Learner-{id}")
     logger.info(f"Starting learner {id}")
     
-    TOTAL_ACCEPTORS = config['acceptor_count']
-    QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
-    
-    logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
-    
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
-    decisions = defaultdict(dict)  # slot -> (value -> count)
-    confirmed_decisions = {}  # Track confirmed decisions and their values: slot -> value
+    confirmed_decisions = {}  # Track confirmed decisions and their values: slot -> value_str
     
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
     s.sendto(catchup_request, config["acceptors"])
@@ -360,29 +354,18 @@ def learner(config, id):
                 value_tuple = msg["v_val"]
                 value_str = str(value_tuple)
                 
-                # Count identical decisions
-                decisions[instance][value_str] = decisions[instance].get(value_str, 0) + 1
-                
-                # Case 1: First time seeing a quorum for this instance
+                # First time seeing this instance
                 if instance not in confirmed_decisions:
-                    for value, count in decisions[instance].items():
-                        if count >= QUORUM_SIZE:
-                            confirmed_value = eval(value)[0]
-                            print(f"{confirmed_value}")
-                            sys.stdout.flush()
-                            confirmed_decisions[instance] = value
-                            break
-                # Case 2: Already have a confirmed decision, print if this matches
-                elif value_str == confirmed_decisions[instance]:
-                    confirmed_value = eval(value_str)[0]
+                    confirmed_value = value_tuple[0]  # Just the value, not client_id
                     print(f"{confirmed_value}")
                     sys.stdout.flush()
+                    confirmed_decisions[instance] = value_str
             
             elif msg["type"] == "CATCHUP":
                 decided = msg.get("decided", {})
                 for slot, (value_tuple, client_id) in sorted(decided.items(), key=lambda x: int(x[0])):
                     slot = int(slot)
-                    value_str = str(value_tuple)
+                    value_str = str([value_tuple, client_id])  # Match format from DECISION
                     if slot not in confirmed_decisions:
                         print(f"{value_tuple[0]}")
                         sys.stdout.flush()
@@ -390,7 +373,7 @@ def learner(config, id):
             
         except Exception as e:
             logger.error(f"Learner {id} error: {e}", exc_info=True)
-
+            
 def client(config, id):
     logger = logging.getLogger(f"Client-{id}")
     logger.info(f"Starting client {id}")
