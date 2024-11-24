@@ -5,11 +5,9 @@ import struct
 import json
 import math
 import time
-import random
 from collections import defaultdict
 import logging
 
-# Configure logging
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
