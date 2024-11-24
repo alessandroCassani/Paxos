@@ -154,7 +154,6 @@ def acceptor(config, id):
                     state["v_val"] = c_val
                     phase2b = create_phase2b_message(state["v_rnd"], state["v_val"], instance, client_id)
                     s.sendto(phase2b, config["proposers"])
-                    decisions[instance] = (c_val, client_id)
                 else:
                     logger.debug(f"Rejecting PHASE2A: c_rnd {c_rnd} < current rnd {state['rnd']}")
 
@@ -179,8 +178,8 @@ def proposer(config, id):
     
     TOTAL_ACCEPTORS = config['acceptor_count']
     QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
-    PHASE_TIMEOUT = 5.0  
-    INITIAL_TIMEOUT = 2.0
+    PHASE_TIMEOUT = 1.0  
+    INITIAL_TIMEOUT = 0.5
     
     logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
     
@@ -196,10 +195,7 @@ def proposer(config, id):
     def check_liveness():
         nonlocal phase_start_time
         if phase_start_time and time.time() - phase_start_time > PHASE_TIMEOUT:
-            logger.warning(f"Timeout waiting for quorum responses. Only received "
-                         f"{len(promises[instance])} promises or "
-                         f"{len(phase2b_msgs[instance])} phase2b messages. "
-                         f"Need {QUORUM_SIZE} out of {TOTAL_ACCEPTORS} acceptors.")
+            logger.warning(f"Timeout waiting for quorum responses")
             return False
         return True
     
@@ -214,6 +210,41 @@ def proposer(config, id):
             phase_start_time = time.time()
             promises[instance].clear()
             phase2b_msgs[instance].clear()
+
+    def handle_phase2b(msg_instance, msg_v_rnd, value):
+        nonlocal instance, c_rnd, phase_start_time
+        if msg_instance == instance and msg_v_rnd == c_rnd:
+            if isinstance(value, list):
+                value = tuple(value)
+            phase2b_msgs[instance].append(value)
+            
+            logger.debug(f"Received {len(phase2b_msgs[instance])}/{QUORUM_SIZE} phase2b messages for instance {instance}")
+            
+            if len(phase2b_msgs[instance]) >= QUORUM_SIZE and check_liveness():
+                value_counts = {}
+                for v in phase2b_msgs[instance]:
+                    if isinstance(v, list):
+                        v = tuple(v)
+                    value_counts[v] = value_counts.get(v, 0) + 1
+                
+                majority_count = max(value_counts.values())
+                if majority_count >= QUORUM_SIZE:
+                    majority_value = max(
+                        (v for v, c in value_counts.items() if c == majority_count)
+                    )
+                    
+                    # Send decision
+                    decision = create_decision_message(majority_value, instance)
+                    s.sendto(decision, config["learners"])
+                    
+                    if instance not in decided:
+                        decided.add(instance)
+                        if majority_value == pending_values[0]:  # If we decided our own value
+                            pending_values.pop(0)
+                        instance += 1
+                        c_rnd = (0, id)
+                        if pending_values:  # Still have values to propose
+                            start_phase1()
     
     while True:
         try:
@@ -231,16 +262,13 @@ def proposer(config, id):
                 msg_instance = msg["slot"]
                 msg_rnd = (msg["rnd_1"], msg["rnd_2"])
                 
-                # Check if this is a response to our current round
                 if msg_instance == instance:
-                    # If we got rejected (received round higher than ours)
                     if msg_rnd > c_rnd:
                         logger.debug(f"Our round {c_rnd} was rejected, got higher round {msg_rnd}")
-                        c_rnd = (msg_rnd[0] + 1, id)  # Increment higher than the received round
-                        start_phase1()  # Retry same instance with higher round
+                        c_rnd = (msg_rnd[0] + 1, id)
+                        start_phase1()
                         continue
                     
-                    # If this is a response to our current round
                     if msg_rnd == c_rnd:
                         v_val = msg["v_val"]
                         if isinstance(v_val, list):
@@ -250,8 +278,6 @@ def proposer(config, id):
                             "v_rnd": (msg["v_rnd_1"], msg["v_rnd_2"]) if msg["v_rnd_1"] is not None else None,
                             "v_val": v_val
                         })
-                        
-                        logger.debug(f"Received {len(promises[instance])}/{QUORUM_SIZE} promises for instance {instance}")
                         
                         if len(promises[instance]) >= QUORUM_SIZE and check_liveness():
                             # Find highest numbered value among responses
@@ -264,10 +290,10 @@ def proposer(config, id):
                                 c_val = highest_promise["v_val"]
                                 logger.debug(f"Found existing value in instance {instance}, must propose: {c_val}")
                             else:
-                                # Free to propose our value
                                 c_val = pending_values[0]
                                 logger.debug(f"Instance {instance} is empty, proposing our value: {c_val}")
                             
+                            # Always proceed with Phase 2A
                             client_id = pending_values[0][1]
                             phase2a = create_phase2a_message(c_rnd, c_val, instance, client_id)
                             s.sendto(phase2a, config["acceptors"])
@@ -276,60 +302,19 @@ def proposer(config, id):
             elif msg_type == "PHASE2B":
                 msg_instance = msg["slot"]
                 msg_v_rnd = (msg["v_rnd_1"], msg["v_rnd_2"])
-                
-                # Check if we got rejected
-                if msg_instance == instance and msg_v_rnd > c_rnd:
-                    logger.debug(f"Our round {c_rnd} was rejected in phase 2, got higher round {msg_v_rnd}")
-                    c_rnd = (msg_v_rnd[0] + 1, id)  # Increment higher than the received round
-                    start_phase1()  # Retry same instance with higher round
-                    continue
-                
-                if msg_instance == instance and msg_v_rnd == c_rnd:
-                    value = msg["v_val"]
-                    if isinstance(value, list):
-                        value = tuple(value)
-                    phase2b_msgs[instance].append(value)
-                    
-                    logger.debug(f"Received {len(phase2b_msgs[instance])}/{QUORUM_SIZE} phase2b messages for instance {instance}")
-                    
-                    if len(phase2b_msgs[instance]) >= QUORUM_SIZE and check_liveness():
-                        value_counts = {}
-                        for v in phase2b_msgs[instance]:
-                            if isinstance(v, list):
-                                v = tuple(v)
-                            value_counts[v] = value_counts.get(v, 0) + 1
-                        
-                        majority_count = max(value_counts.values())
-                        if majority_count >= QUORUM_SIZE:
-                            majority_value = max(
-                                (v for v, c in value_counts.items() if c == majority_count)
-                            )
-                            
-                            # Send decision
-                            decision = create_decision_message(majority_value, instance)
-                            s.sendto(decision, config["learners"])
-                            
-                            # Only advance to next instance after successfully deciding current one
-                            if instance not in decided:
-                                decided.add(instance)
-                                # Remove our value from pending if it was the one decided
-                                if majority_value == pending_values[0]:
-                                    pending_values.pop(0)
-                                # Move to next instance
-                                instance += 1
-                                c_rnd = (0, id)  # Reset round for new instance
-                                if pending_values:  # If we still have values to propose
-                                    start_phase1()
-            
+                value = msg["v_val"]
+                handle_phase2b(msg_instance, msg_v_rnd, value)
+
             elif msg_type == "DECISION":
                 decided_instance = msg["slot"]
                 decided_value = msg["v_val"]
+                if isinstance(decided_value, list):
+                    decided_value = tuple(decided_value)
+                
                 if decided_instance not in decided:
                     decided.add(decided_instance)
-                    # If this was our instance and value, remove it from pending
                     if pending_values and decided_value == pending_values[0]:
                         pending_values.pop(0)
-                    # Move to next instance if we were working on this one
                     if decided_instance == instance:
                         instance += 1
                         c_rnd = (0, id)
@@ -337,13 +322,12 @@ def proposer(config, id):
                             start_phase1()
                 
         except BlockingIOError:
-            # If we haven't heard back in a while, retry with higher round number
             if pending_values and time.time() - last_attempt > INITIAL_TIMEOUT and instance not in decided:
                 if check_liveness():
-                    c_rnd = (c_rnd[0] + 1, c_rnd[1])
-                    start_phase1()  # Retry same instance with higher round
+                    c_rnd = (c_rnd[0] + 1, id)
+                    start_phase1()
                 else:
-                    logger.warning(f"Cannot make progress: not enough acceptors responding (need {QUORUM_SIZE} out of {TOTAL_ACCEPTORS})")
+                    logger.warning("Cannot make progress: not enough acceptors responding")
         except Exception as e:
             logger.error(f"Error: {e}", exc_info=True)
 
@@ -359,7 +343,7 @@ def learner(config, id):
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
     decisions = defaultdict(dict)  # slot -> (value -> count)
-    confirmed_decisions = set()  # Track confirmed decisions
+    confirmed_decisions = {}  # Track confirmed decisions and their values: slot -> value
     
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
     s.sendto(catchup_request, config["acceptors"])
@@ -374,28 +358,35 @@ def learner(config, id):
             if msg["type"] == "DECISION":
                 instance = msg["slot"]
                 value_tuple = msg["v_val"]
+                value_str = str(value_tuple)
                 
                 # Count identical decisions
-                decisions[instance][str(value_tuple)] = decisions[instance].get(str(value_tuple), 0) + 1
+                decisions[instance][value_str] = decisions[instance].get(value_str, 0) + 1
                 
-                # Only accept and print decision when we have a quorum of identical values
+                # Case 1: First time seeing a quorum for this instance
                 if instance not in confirmed_decisions:
                     for value, count in decisions[instance].items():
                         if count >= QUORUM_SIZE:
-                            print(f"{eval(value)[0]}")
+                            confirmed_value = eval(value)[0]
+                            print(f"{confirmed_value}")
                             sys.stdout.flush()
-                            confirmed_decisions.add(instance)
+                            confirmed_decisions[instance] = value
                             break
+                # Case 2: Already have a confirmed decision, print if this matches
+                elif value_str == confirmed_decisions[instance]:
+                    confirmed_value = eval(value_str)[0]
+                    print(f"{confirmed_value}")
+                    sys.stdout.flush()
             
             elif msg["type"] == "CATCHUP":
                 decided = msg.get("decided", {})
                 for slot, (value_tuple, client_id) in sorted(decided.items(), key=lambda x: int(x[0])):
-                    if int(slot) not in confirmed_decisions:
-                        decisions[slot][str(value_tuple)] = decisions[slot].get(str(value_tuple), 0) + 1
-                        if decisions[slot][str(value_tuple)] >= QUORUM_SIZE:
-                            print(f"{value_tuple[0]}")
-                            sys.stdout.flush()
-                            confirmed_decisions.add(int(slot))
+                    slot = int(slot)
+                    value_str = str(value_tuple)
+                    if slot not in confirmed_decisions:
+                        print(f"{value_tuple[0]}")
+                        sys.stdout.flush()
+                        confirmed_decisions[slot] = value_str
             
         except Exception as e:
             logger.error(f"Learner {id} error: {e}", exc_info=True)
