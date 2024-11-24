@@ -335,7 +335,8 @@ def learner(config, id):
     
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
-    decisions = {}  # instance -> value_str
+    decisions = {}  # instance -> [value_tuple, client_id]
+    decision_counts = defaultdict(int)  # instance -> count
     next_to_print = 0  # Next instance number to print
     
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
@@ -349,20 +350,41 @@ def learner(config, id):
             msg = json.loads(data.decode())
             
             if msg["type"] == "DECISION":
+                instance = msg["slot"]
                 value_tuple = msg["v_val"]
-                print(f"{value_tuple[0]}")
-                sys.stdout.flush()
+                
+                # Store decision
+                if instance not in decisions:
+                    decisions[instance] = [value_tuple, None]
+                    decision_counts[instance] = 1
+                else:
+                    # If we already have a decision for this instance, check if it's different
+                    if decisions[instance][0] != value_tuple:
+                        logger.error(f"Conflicting decisions for instance {instance}: {decisions[instance][0]} vs {value_tuple}")
+                    decision_counts[instance] += 1
+                
+                # Print all decisions in order once we have received all proposers' decisions
+                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
+                    value = decisions[next_to_print][0][0]
+                    print(f"{value}")
+                    sys.stdout.flush()
+                    next_to_print += 1
             
             elif msg["type"] == "CATCHUP":
                 decided = msg.get("decided", {})
                 for slot, (value_tuple, client_id) in sorted(decided.items(), key=lambda x: int(x[0])):
                     slot = int(slot)
-                    value_str = str([value_tuple, client_id])
                     if slot not in decisions:
                         decisions[slot] = [value_tuple, client_id]
+                        decision_counts[slot] = 1
+                    else:
+                        # If we already have a decision for this instance, check if it's different
+                        if decisions[slot][0] != value_tuple:
+                            logger.error(f"Conflicting decisions for instance {slot}: {decisions[slot][0]} vs {value_tuple}")
+                        decision_counts[slot] += 1
                         
                 # Print all decisions in order after catchup
-                while next_to_print in decisions:
+                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
                     value = decisions[next_to_print][0]
                     print(f"{value}")
                     sys.stdout.flush()
