@@ -10,11 +10,9 @@ fi
 
 cd "$projdir" || exit 1
 
-# Clean up any existing processes
 pkill -f "$conf"
 wait
 
-# Generate proposal files
 ../generate.sh 10 > prop1.txt
 ../generate.sh 10 > prop2.txt
 
@@ -40,7 +38,7 @@ echo "Starting the second learner..."
 ./learner.sh 2 "$conf" > learn2.log &
 sleep 1
 
-echo "Adding another client to propose another 100 values..."
+echo "Adding another client to propose another 10 values..."
 ./client.sh 2 "$conf" < prop2.txt &
 sleep 10
 
