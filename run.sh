@@ -19,7 +19,7 @@ echo "starting acceptors..."
 
 ./acceptor.sh 1 "$conf" &
 ./acceptor.sh 2 "$conf" &
-./acceptor.sh 3 "$conf" &
+#./acceptor.sh 3 "$conf" &
 
 sleep 1
 echo "starting learners..."

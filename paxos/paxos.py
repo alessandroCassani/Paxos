@@ -151,6 +151,7 @@ def acceptor(config, id):
                     state["v_rnd"] = c_rnd
                     state["v_val"] = c_val
                     phase2b = create_phase2b_message(state["v_rnd"], state["v_val"], instance, client_id)
+                    decisions[instance] = c_val
                     s.sendto(phase2b, config["proposers"])
                 else:
                     logger.debug(f"Rejecting PHASE2A: c_rnd {c_rnd} < current rnd {state['rnd']}")
@@ -182,15 +183,15 @@ def proposer(config, id):
     logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
     
     num_proposers = len([k for k in config.keys() if k.startswith('proposer')])
-    c_rnd = (id, id)  # Start with proposer id
+    c_rnd = (id, id)  
     next_instance = 0
-    current_instances = set()  # Track instances being worked on
+    current_instances = set() 
     pending_values = []
     promises = defaultdict(list)
     phase2b_msgs = defaultdict(list)
     decided = set()
-    last_attempts = defaultdict(float)  # Track last attempt per instance
-    phase_start_times = defaultdict(float)  # Track phase start time per instance
+    last_attempts = defaultdict(float) 
+    phase_start_times = defaultdict(float)  
     
     def check_liveness(instance):
         if phase_start_times[instance] and time.time() - phase_start_times[instance] > PHASE_TIMEOUT:

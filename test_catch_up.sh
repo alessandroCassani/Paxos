@@ -23,7 +23,7 @@ echo "Starting acceptors..."
 sleep 1
 
 echo "Starting the first learner..."
-./learner.sh 1 "$conf" > learn1.log &
+./learner.sh 1 "$conf" >../learn1 &
 sleep 1
 
 echo "Starting the proposer..."
@@ -35,7 +35,7 @@ echo "Client proposing 10 values..."
 sleep 10
 
 echo "Starting the second learner..."
-./learner.sh 2 "$conf" > learn2.log &
+./learner.sh 2 "$conf" >../learn2 &
 sleep 1
 
 echo "Adding another client to propose another 10 values..."
@@ -43,7 +43,7 @@ echo "Adding another client to propose another 10 values..."
 sleep 10
 
 echo "Waiting for learners to complete..."
-sleep 10
+sleep 5
 
 echo "Stopping all processes..."
 pkill -f "$conf"
