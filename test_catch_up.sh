@@ -13,8 +13,8 @@ cd "$projdir" || exit 1
 pkill -f "$conf"
 wait
 
-../generate.sh 10 > prop1.txt
-../generate.sh 10 > prop2.txt
+../generate.sh 100 > prop1.txt
+../generate.sh 100 > prop2.txt
 
 echo "Starting acceptors..."
 ./acceptor.sh 1 "$conf" &

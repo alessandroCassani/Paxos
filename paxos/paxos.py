@@ -90,7 +90,7 @@ def parse_cfg(cfgpath):
             if role.startswith('acceptor'):
                 acceptor_count += 1
             cfg[role] = (host, int(port))
-    cfg['acceptor_count'] = 3  #hardoded
+    cfg['acceptor_count'] = 1
     logging.debug(f"Parsed config: {cfg}")
     return cfg
 
@@ -176,7 +176,7 @@ def proposer(config, id):
     s = mcast_sender()
     
     TOTAL_ACCEPTORS = config['acceptor_count']
-    QUORUM_SIZE = math.ceil((TOTAL_ACCEPTORS + 1) / 2)
+    QUORUM_SIZE = get_quorum(TOTAL_ACCEPTORS)
     PHASE_TIMEOUT = 0.5  
     INITIAL_TIMEOUT = 0.2
     
@@ -334,11 +334,14 @@ def learner(config, id):
     
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
-    decisions = {}  # instance -> value
-    next_to_print = 0
+    decisions = {}  # instance -> [value_tuple, client_id]
+    decision_counts = defaultdict(int)  
+    next_to_print = 0 
     
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
     s.sendto(catchup_request, config["acceptors"])
+    
+    logger.info("Sent initial CATCHUP request")
     
     while True:
         try:
@@ -349,36 +352,39 @@ def learner(config, id):
                 instance = msg["slot"]
                 value_tuple = msg["v_val"]
                 
-                # Store decision without counting
                 if instance not in decisions:
-                    decisions[instance] = value_tuple
-                elif decisions[instance] != value_tuple:
-                    logger.error(f"Conflicting decisions for instance {instance}")
-                
-                # Print all available decisions in order
-                while next_to_print in decisions:
-                    value = decisions[next_to_print][0] # Access first element of value tuple
+                    decisions[instance] = [value_tuple, None]
+                    decision_counts[instance] = 1
+
+            
+                while next_to_print in decisions :
+                    value = decisions[next_to_print][0][0]
                     print(f"{value}")
                     sys.stdout.flush()
                     next_to_print += 1
-                    
+            
             elif msg["type"] == "CATCHUP":
-                for slot, value_tuple in sorted(msg.get("decided", {}).items(), key=lambda x: int(x[0])):
+                decided = msg.get("decided", {})
+                for slot, (value_tuple, client_id) in sorted(decided.items(), key=lambda x: int(x[0])):
                     slot = int(slot)
                     if slot not in decisions:
-                        decisions[slot] = value_tuple
-                    elif decisions[slot] != value_tuple:
-                        logger.error(f"Conflicting decisions for slot {slot}")
-                
-                # Print any newly available decisions
-                while next_to_print in decisions:
+                        decisions[slot] = [value_tuple, client_id]
+                        decision_counts[slot] = 1
+                    else:
+                        # If we already have a decision for this instance, check if it's different
+                        if decisions[slot][0] != value_tuple:
+                            logger.error(f"Conflicting decisions for instance {slot}: {decisions[slot][0]} vs {value_tuple}")
+                        decision_counts[slot] += 1
+                        
+                # Print all decisions in order after catchup
+                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
                     value = decisions[next_to_print][0]
                     print(f"{value}")
                     sys.stdout.flush()
                     next_to_print += 1
-                    
+            
         except Exception as e:
-            logger.error(f"Error: {e}", exc_info=True)
+            logger.error(f"Learner {id} error: {e}", exc_info=True)
             
 def client(config, id):
     logger = logging.getLogger(f"Client-{id}")
