@@ -334,8 +334,8 @@ def learner(config, id):
     r = mcast_receiver(config["learners"])
     s = mcast_sender()
     decisions = {}  # instance -> [value_tuple, client_id]
-    decision_counts = defaultdict(int)  # instance -> count
-    next_to_print = 0  # Next instance number to print
+    decision_counts = defaultdict(int)  
+    next_to_print = 0 
     
     catchup_request = json.dumps({"type": "CATCHUP"}).encode()
     s.sendto(catchup_request, config["acceptors"])
