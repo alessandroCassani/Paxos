@@ -87,10 +87,8 @@ def parse_cfg(cfgpath):
     with open(cfgpath, "r") as cfgfile:
         for line in cfgfile:
             (role, host, port) = line.split()
-            if role.startswith('acceptor'):
-                acceptor_count += 1
             cfg[role] = (host, int(port))
-    cfg['acceptor_count'] = acceptor_count
+    cfg['acceptor_count'] = 3  #hardcode
     logging.debug(f"Parsed config: {cfg}")
     return cfg
 
@@ -362,7 +360,7 @@ def learner(config, id):
                     decision_counts[instance] += 1
                 
                 # Print all decisions in order once we have received all proposers' decisions
-                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
+                while next_to_print in decisions and decision_counts[next_to_print]:
                     value = decisions[next_to_print][0][0]
                     print(f"{value}")
                     sys.stdout.flush()
