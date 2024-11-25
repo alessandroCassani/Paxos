@@ -87,10 +87,8 @@ def parse_cfg(cfgpath):
     with open(cfgpath, "r") as cfgfile:
         for line in cfgfile:
             (role, host, port) = line.split()
-            if role.startswith('acceptor'):
-                acceptor_count += 1
             cfg[role] = (host, int(port))
-    cfg['acceptor_count'] = 1
+    cfg['acceptor_count'] = 3
     logging.debug(f"Parsed config: {cfg}")
     return cfg
 
@@ -352,12 +350,18 @@ def learner(config, id):
                 instance = msg["slot"]
                 value_tuple = msg["v_val"]
                 
+                # Store decision
                 if instance not in decisions:
                     decisions[instance] = [value_tuple, None]
                     decision_counts[instance] = 1
-
-            
-                while next_to_print in decisions :
+                else:
+                    # If we already have a decision for this instance, check if it's different
+                    if decisions[instance][0] != value_tuple:
+                        logger.error(f"Conflicting decisions for instance {instance}: {decisions[instance][0]} vs {value_tuple}")
+                    decision_counts[instance] += 1
+                
+                # Print all decisions in order once we have received all proposers' decisions
+                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
                     value = decisions[next_to_print][0][0]
                     print(f"{value}")
                     sys.stdout.flush()
