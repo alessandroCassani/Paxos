@@ -88,7 +88,7 @@ def parse_cfg(cfgpath):
         for line in cfgfile:
             (role, host, port) = line.split()
             cfg[role] = (host, int(port))
-    cfg['acceptor_count'] = 3
+    cfg['acceptor_count'] = 3  #hardcode
     logging.debug(f"Parsed config: {cfg}")
     return cfg
 
@@ -149,7 +149,6 @@ def acceptor(config, id):
                     state["v_rnd"] = c_rnd
                     state["v_val"] = c_val
                     phase2b = create_phase2b_message(state["v_rnd"], state["v_val"], instance, client_id)
-                    decisions[instance] = c_val
                     s.sendto(phase2b, config["proposers"])
                 else:
                     logger.debug(f"Rejecting PHASE2A: c_rnd {c_rnd} < current rnd {state['rnd']}")
@@ -181,15 +180,15 @@ def proposer(config, id):
     logger.info(f"Operating with {TOTAL_ACCEPTORS} acceptors, quorum size is {QUORUM_SIZE}")
     
     num_proposers = len([k for k in config.keys() if k.startswith('proposer')])
-    c_rnd = (id, id)  
+    c_rnd = (id, id)  # Start with proposer id
     next_instance = 0
-    current_instances = set() 
+    current_instances = set()  # Track instances being worked on
     pending_values = []
     promises = defaultdict(list)
     phase2b_msgs = defaultdict(list)
     decided = set()
-    last_attempts = defaultdict(float) 
-    phase_start_times = defaultdict(float)  
+    last_attempts = defaultdict(float)  # Track last attempt per instance
+    phase_start_times = defaultdict(float)  # Track phase start time per instance
     
     def check_liveness(instance):
         if phase_start_times[instance] and time.time() - phase_start_times[instance] > PHASE_TIMEOUT:
@@ -361,7 +360,7 @@ def learner(config, id):
                     decision_counts[instance] += 1
                 
                 # Print all decisions in order once we have received all proposers' decisions
-                while next_to_print in decisions and decision_counts[next_to_print] == config['acceptor_count']:
+                while next_to_print in decisions and decision_counts[next_to_print]:
                     value = decisions[next_to_print][0][0]
                     print(f"{value}")
                     sys.stdout.flush()
