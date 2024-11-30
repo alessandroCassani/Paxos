@@ -15,6 +15,5 @@ def client(config, id):
         proposal = create_propose_message(value, id)
         s.sendto(proposal, config["proposers"])
         logger.debug(f"Sent proposal with value: {value}")
-        time.sleep(0.001)
     
     logger.info(f"Client {id} finished")
